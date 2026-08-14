@@ -387,6 +387,11 @@ class Envs:
     SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE = EnvBool(True)
     # Physical KV-page checks: committed<=allocated + no page alias.
     SGLANG_CHECK_KV_PAGE_INVARIANTS = EnvBool(False)
+    # CAI: full radix-tree structural sanity check on scheduler-idle events.
+    # O(whole tree) walk (collect all nodes + LRU + size recount); on a warm
+    # multi-hundred-k-token tree it blocks the event loop for long enough to
+    # delay newly arrived batches. Debugging aid, off by default in this fork.
+    SGLANG_TREE_CACHE_SANITY_CHECK = EnvBool(False)
 
     # Load snapshot backend
     SGLANG_LOAD_SNAPSHOT_USE_ZMQ = EnvBool(False)
