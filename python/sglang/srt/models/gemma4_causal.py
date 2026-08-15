@@ -261,7 +261,9 @@ class Gemma4MoE(nn.Module):
             top_k=config.top_k_experts,
             quant_config=quant_config,
             prefix=add_prefix("experts", prefix),
-            activation="gelu",
+            # CAI: the checkpoint's hidden_activation is gelu_pytorch_tanh;
+            # passing "gelu" ran erf-GELU in the triton/aiter fused kernels.
+            activation="gelu_tanh",
             reduce_results=True,
         )
 

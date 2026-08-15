@@ -40,6 +40,8 @@ def fused_moe_forward_native(
         x1 = F.silu(x1)
     elif moe_runner_config.activation == "gelu":
         x1 = F.gelu(x1)
+    elif moe_runner_config.activation == "gelu_tanh":
+        x1 = F.gelu(x1, approximate="tanh")
     elif moe_runner_config.activation == "situ":
         beta = (
             moe_runner_config.gemm1_alpha
@@ -85,6 +87,8 @@ def moe_forward_native(
         act = SiluAndMul()
     elif moe_runner_config.activation == "gelu":
         act = GeluAndMul()
+    elif moe_runner_config.activation == "gelu_tanh":
+        act = GeluAndMul(approximate="tanh")
     elif moe_runner_config.activation == "situ":
         situ_beta = (
             moe_runner_config.gemm1_alpha

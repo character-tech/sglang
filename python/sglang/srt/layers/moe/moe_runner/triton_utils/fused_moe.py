@@ -60,11 +60,15 @@ _is_musa = is_musa()
 if _is_cuda:
     from sgl_kernel import moe_sum_reduce
 
-    from sglang.kernels.ops.activation.activation import gelu_and_mul, silu_and_mul
+    from sglang.kernels.ops.activation.activation import (
+        gelu_and_mul,
+        gelu_tanh_and_mul,
+        silu_and_mul,
+    )
 elif _is_cpu and _is_cpu_amx_available:
     pass
 elif _is_hip:
-    from sgl_kernel import gelu_and_mul, silu_and_mul
+    from sgl_kernel import gelu_and_mul, gelu_tanh_and_mul, silu_and_mul
 
     if _use_aiter:
         try:
@@ -719,6 +723,19 @@ def _fused_moe_kernel_sequence(
                 x = intermediate_cache1.view(-1, N)
                 d = x.shape[-1] // 2
                 intermediate_cache2.copy_(F.gelu(x[..., :d]) * x[..., d:])
+    elif activation == "gelu_tanh" and is_gated:
+        # CAI: gemma-4 uses gelu_pytorch_tanh; the "gelu" branch above is
+        # erf-GELU in the fused kernels, which silently changes the activation.
+        assert gemm1_alpha is None, "gemm1_alpha is not supported for gelu_tanh"
+        assert gemm1_limit is None, "gemm1_limit is not supported for gelu_tanh"
+        if _is_cuda or _is_hip:
+            gelu_tanh_and_mul(intermediate_cache1.view(-1, N), intermediate_cache2)
+        else:
+            x = intermediate_cache1.view(-1, N)
+            d = x.shape[-1] // 2
+            intermediate_cache2.copy_(
+                F.gelu(x[..., :d], approximate="tanh") * x[..., d:]
+            )
     # Activation function without multiplication
     elif activation == "silu" and not is_gated:
         intermediate_cache2 = F.silu(intermediate_cache1.view(-1, N))
