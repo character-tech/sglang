@@ -1279,6 +1279,17 @@ class TritonAttnBackend(AttentionBackend):
             k_buffer, v_buffer = pool.get_kv_buffer(layer.layer_id)
             k = k_buffer[cache_loc]
             v = v_buffer[cache_loc]
+            # CAI (upstream PR #22615): KV-sharing layers pull K/V straight from
+            # the cache; with a quantized KV cache these arrive as fp8 and the
+            # extend kernel's tl.dot(bf16_q, fp8_k) fails to compile. Dequantize
+            # to the compute dtype (issue #22277).
+            if k.dtype != q.dtype:
+                k = k.to(q.dtype)
+                v = v.to(q.dtype)
+                if layer.k_scale_float is not None:
+                    k.mul_(layer.k_scale_float)
+                if layer.v_scale_float is not None:
+                    v.mul_(layer.v_scale_float)
         elif k is None or v is None:
             raise ValueError("Both k and v should be None or not None")
         else:
