@@ -949,6 +949,33 @@ class UnifiedRadixCache(BasePrefixCache):
                 return None
         aux_xfers = [x for xfers in comp_xfers.values() for x in xfers]
         aux_xfers.extend(sidecar_xfers)
+        # Pre-evict the extra host pools (SWA/Mamba) here, at the same action
+        # barrier where the anchor pool is pre-evicted above. write() must
+        # never evict host pools itself (re-entrant tree walk -> GPU fault at
+        # host saturation; see _resolve_pool_transfers_allocation).
+        pool_to_component = {
+            PoolName.SWA: ComponentType.SWA,
+            PoolName.MAMBA: ComponentType.MAMBA,
+        }
+        extra_needs: dict[PoolName, int] = {}
+        for xfer in aux_xfers:
+            if (
+                xfer.indices_from_pool is None
+                and xfer.name in pool_to_component
+                and xfer.device_indices is not None
+            ):
+                extra_needs[xfer.name] = extra_needs.get(xfer.name, 0) + len(
+                    xfer.device_indices
+                )
+        for pool_name, need in extra_needs.items():
+            entry = self.cache_controller.mem_pool_host.entry_map.get(pool_name)
+            if entry is None:
+                continue
+            avail = entry.host_pool.available_size()
+            if avail < need:
+                shortfall = need - avail
+                if self.evict_host(shortfall, pool_to_component[pool_name]) < shortfall:
+                    return None
         return self.cache_controller.write(
             device_value, node_id=node_id, extra_pools=aux_xfers or None
         )
