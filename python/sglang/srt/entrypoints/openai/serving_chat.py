@@ -1599,11 +1599,20 @@ class OpenAIServingChat(OpenAIServingBase):
                     final_finish_reason = "tool_calls"
 
                 matched_stop = finish_reason_data.get("matched")
+                # CAI: include content="" in the finish chunk (matching vLLM's
+                # shape). The chat-service Go parser
+                # (modelServerVLLMChatJsonToCandidates) errors on chunks that
+                # have an id but no choices[0].delta.content and no usage
+                # field ("invalid model server json: len(RespSentences)=0"),
+                # which aborts Generate AFTER streaming and skips the sticky
+                # route-cookie store — silently breaking per-chat pod affinity
+                # for every multi-replica deployment.
                 yield build_sse_content(
                     chunk_id=content["meta_info"]["id"],
                     created=int(time.time()),
                     model=request.model,
                     index=idx,
+                    content="",
                     finish_reason=final_finish_reason,
                     matched_stop=matched_stop,
                 )
