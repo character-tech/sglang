@@ -195,7 +195,7 @@ class SWAComponent(TreeComponent):
                 raise ValueError(f"Unknown LRURefreshPhase: {phase}")
 
     def create_match_validator(
-        self, match_device_only: bool = False
+        self, match_device_only: bool = False, bookkeeping: bool = False
     ) -> Callable[[UnifiedTreeNode], bool]:
         sliding_window_size = self.sliding_window_size
         ct = self.component_type
@@ -206,6 +206,19 @@ class SWAComponent(TreeComponent):
         swa_device_only_hicache = (
             not self.tree_core.has_swa_host_pool and self.tree_core.enable_hicache
         )
+
+        # CAI: ownership rematch (cache_unfinished_req). The window rule is a
+        # match-ENDPOINT quality rule for future requests; ownership of the
+        # request's device prefix is decided by the Full component alone. The
+        # request computed (or restored) every one of these positions itself,
+        # so its own SWA coverage is intact regardless of tree-side SWA
+        # tombstones. Without this, an insert that unevicts host-backed nodes
+        # (donating the request's fresh KV) counts a longer prefix than the
+        # window-rule rematch validates: cache_protected_len under-advances,
+        # and the next insert's duplicate-free releases slots the tree owns
+        # (the stash x restore crash: new_prefix_len > len(new_indices)).
+        if bookkeeping and swa_device_only_hicache:
+            return lambda node: True
 
         def validator(node: UnifiedTreeNode) -> bool:
             cd = node.component_data[ct]

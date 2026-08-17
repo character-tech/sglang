@@ -128,7 +128,7 @@ class MambaComponent(TreeComponent):
                 raise ValueError(f"Unknown LRURefreshPhase: {phase}")
 
     def create_match_validator(
-        self, match_device_only: bool = False
+        self, match_device_only: bool = False, bookkeeping: bool = False
     ) -> Callable[[UnifiedTreeNode], bool]:
         ct = self.component_type
         if match_device_only:

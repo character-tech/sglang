@@ -628,7 +628,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             best_match_device_value_len,
             full_kv_hit_length,
             action,
-        ) = self._match_prefix_helper(key)
+        ) = self._match_prefix_helper(key, bookkeeping=params.bookkeeping)
         return self._match_post_processor(
             params,
             value,
@@ -639,7 +639,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             action,
         )
 
-    def _match_prefix_helper(self, key: RadixKey) -> tuple[
+    def _match_prefix_helper(self, key: RadixKey, bookkeeping: bool = False) -> tuple[
         list[torch.Tensor],
         UnifiedTreeNode,
         UnifiedTreeNode,
@@ -665,12 +665,16 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                 comp.create_match_validator() for comp in self.components
             )
             device_validators = tuple(
-                comp.create_match_validator(match_device_only=True)
+                comp.create_match_validator(
+                    match_device_only=True, bookkeeping=bookkeeping
+                )
                 for comp in self.components
             )
         else:
             validators = tuple(
-                comp.create_match_validator(match_device_only=True)
+                comp.create_match_validator(
+                    match_device_only=True, bookkeeping=bookkeeping
+                )
                 for comp in self.components
             )
 

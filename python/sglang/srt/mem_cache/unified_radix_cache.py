@@ -793,8 +793,14 @@ class UnifiedRadixCache(BasePrefixCache):
         insert_params.value = values
         result = self.insert(insert_params)
 
-        # Match prefix
-        match_result = self.match_prefix(MatchPrefixParams(key=radix_key))
+        # Match prefix. Bookkeeping mode: this rematch decides which
+        # contiguous device-resident prefix the request now sits on (locks,
+        # cache_protected_len, req_to_token rewrite) — it must cover every
+        # node the insert donated/unevicted, so endpoint-quality validators
+        # (SWA window rule) do not apply here.
+        match_result = self.match_prefix(
+            MatchPrefixParams(key=radix_key, bookkeeping=True)
+        )
         new_indices = match_result.device_indices
         new_last_node = match_result.last_device_node
         new_prefix_len = result.prefix_len

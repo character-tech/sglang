@@ -340,13 +340,17 @@ class TreeComponent(ABC):
 
     @abstractmethod
     def create_match_validator(
-        self, match_device_only: bool = False
+        self, match_device_only: bool = False, bookkeeping: bool = False
     ) -> Callable[[UnifiedTreeNode], bool]:
         """Return a per-match stateful predicate that decides whether a node
         is a valid match boundary for this component.
         Called once per match_prefix; the returned closure may carry state.
         When match_device_only is true, host-backed nodes must not be accepted
         as valid match boundaries.
+        When bookkeeping is true (the cache_unfinished_req ownership rematch),
+        the device match must cover the full contiguous device-resident prefix
+        the request sits on — endpoint-quality rules (SWA window) must not
+        apply. See SWAComponent.
         - Full: returns True if the node has full component data.
         - SWA: tracks accumulated length since last gap; returns True only
           when the contiguous window reaches swa_sliding_window_size.

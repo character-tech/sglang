@@ -99,8 +99,11 @@ class FullComponent(TreeComponent):
             node = node.parent
 
     def create_match_validator(
-        self, match_device_only: bool = False
+        self, match_device_only: bool = False, bookkeeping: bool = False
     ) -> Callable[[UnifiedTreeNode], bool]:
+        # bookkeeping needs no special handling: device-value presence IS the
+        # ownership criterion (the walk cannot advance the device match past
+        # an evicted node, so contiguity is preserved).
         if match_device_only:
             return (
                 lambda node: node.component_data[self.component_type].value is not None
