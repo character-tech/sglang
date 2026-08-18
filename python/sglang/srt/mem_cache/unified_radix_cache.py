@@ -2053,6 +2053,37 @@ class UnifiedRadixCache(BasePrefixCache):
         # Reap the previous round's PP-sync sends before issuing new ones.
         self._drain_async_work()
 
+        # CAI watermark host eviction: keep the FULL host pool below the
+        # watermark by evicting a bounded batch per scheduler step, so the
+        # write-back backup barrier always finds free pages and never runs
+        # the (synchronous, python-heavy) host eviction itself. Measured
+        # 2026-08-18: at 100% host fill the barrier-time eviction cuts the
+        # service rate 10-50% the moment the pool saturates. Same eviction
+        # entry point as the barrier path (drive_host_eviction) -> same
+        # DMA/lock safety invariants; only the WHEN moves.
+        self._watermark_host_eviction()
+
+    _WATERMARK = float(os.environ.get("SGLANG_HICACHE_HOST_EVICT_WATERMARK", "0.95"))
+    _WATERMARK_STEP_TOKENS = int(
+        os.environ.get("SGLANG_HICACHE_HOST_EVICT_STEP_TOKENS", "65536")
+    )
+
+    def _watermark_host_eviction(self) -> None:
+        if self._WATERMARK <= 0 or self.cache_controller is None:
+            return
+        pool = self.cache_controller.mem_pool_host
+        if pool is None:
+            return
+        size = getattr(pool, "size", 0)
+        if not size:
+            return
+        used = size - pool.available_size()
+        target_used = int(size * self._WATERMARK)
+        if used <= target_used:
+            return
+        need = min(used - target_used, self._WATERMARK_STEP_TOKENS)
+        self.evict_host(need, BASE_COMPONENT_TYPE)
+
         if self.pp_size != 1:
             self.writing_check()
             self.loading_check()
