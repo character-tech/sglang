@@ -586,6 +586,15 @@ class ServerArgs:
         "Enable the multimodal functionality for the served model. If the model being served is not multimodal, nothing will happen",
         NS("mm"),
     ] = None
+    disable_multimodal: A[
+        bool,
+        "Force-disable multimodal for a VLM: serve text-only, skip the image "
+        "warmup, and (for models that gate on it, e.g. gemma-4) skip loading "
+        "the vision/audio towers. The counterpart of vLLM's "
+        "--language-model-only for models the encoder-disagg --language-only "
+        "does not support.",
+        NS("mm"),
+    ] = False
     revision: A[
         Optional[str],
         "The specific model version to use. It can be a branch name, a tag name, or a commit id. If unspecified, will use the default version.",
@@ -3531,6 +3540,10 @@ class ServerArgs:
 
         # Handle memory-related, chunked prefill, and CUDA graph batch size configurations.
         self._handle_gpu_memory_settings(gpu_mem)
+
+        # --disable-multimodal wins over auto-detection and --enable-multimodal.
+        if self.disable_multimodal:
+            self.enable_multimodal = False
 
         # Apply model-specific adjustments.
         self._handle_model_specific_adjustments()
