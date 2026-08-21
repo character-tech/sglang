@@ -69,6 +69,26 @@ if TYPE_CHECKING:
 
 _MLA_DECODE_MIN_BLOCK_KV = 32
 
+# CAI split-KV load-balancing policy (SGLANG_G4_SPLITKV_POLICY, default OFF).
+# Gemma-4 GLOBAL layers have only 2 (26b) / 4 (31b) KV heads at head_dim 512;
+# at decode bs 256-768 the stock get_num_kv_splits under-fills the 304-CU
+# gfx942 GPU and splits uniformly rather than proportionally to context length,
+# so a lone 32k request serializes while short ones idle CUs. The policy sizes
+# each request's splits from a cost-model chunk chosen to fill ~SPLITKV_CU_MULT
+# co-resident split-workgroups per CU, capped higher for few-KV-head shapes.
+_SPLITKV_MIN_BLOCK_KV = 32
+# Target co-resident split-workgroups per CU (2-4x the CU count in total).
+_SPLITKV_CU_MULT = 3
+# Raised per-request split cap for the few-KV-head (<=4) global shape; the
+# stock triton_attention_num_kv_splits cap (typically 16) stays the ceiling for
+# everything else.
+_SPLITKV_FEW_KV_HEAD = 4
+_SPLITKV_FEW_KV_HEAD_MAX_SPLITS = 64
+
+
+def _splitkv_policy_enabled() -> bool:
+    return get_bool_env_var("SGLANG_G4_SPLITKV_POLICY", "false")
+
 
 def _mla_decode_kv_splits_cap(
     base_max_kv_splits: int, sm_count: int, max_context_len: int
@@ -227,6 +247,22 @@ class TritonAttnBackend(AttentionBackend):
                 # fp32 attn_logits buffer to ~4 GiB on Kimi-K2.6 and faulting in
                 # ROCm graph replay; pin to 256 to match validated gfx950 behavior.
                 self.max_kv_splits = min(self.max_kv_splits, 256)
+
+        # CAI split-KV policy: raise the split ceiling for few-KV-head shapes so
+        # long-context global-layer requests can fan out across the CUs. This is
+        # the ONLY place max_kv_splits changes; every buffer (attn_logits,
+        # attn_lse, cuda_graph_*) and the kernel grid split-dim are sized from it
+        # here, so the raised cap is baked into the captured graph and per-request
+        # policy only ever writes values in [1, max_kv_splits] into the existing
+        # num_kv_splits buffer (no shape/grid change at replay). Skip for MLA
+        # (own cap above) and deterministic (fixed split_tile_size below).
+        self.splitkv_policy = (
+            _splitkv_policy_enabled() and not self.use_mla and not _is_xpu
+        )
+        if self.splitkv_policy and self.num_kv_head <= _SPLITKV_FEW_KV_HEAD:
+            self.max_kv_splits = max(
+                self.max_kv_splits, _SPLITKV_FEW_KV_HEAD_MAX_SPLITS
+            )
         if _is_cuda:
             self.use_pdl = is_arch_support_pdl()
         else:
@@ -254,12 +290,17 @@ class TritonAttnBackend(AttentionBackend):
                 "SGLANG_TRITON_DECODE_SPLIT_TILE_SIZE", 256
             )
             self.static_kv_splits = False
+            # Deterministic mode owns the split count via a fixed tile size;
+            # the cost-model policy would break batch invariance.
+            self.splitkv_policy = False
         else:
             self.split_tile_size = (
                 model_runner.server_args.triton_attention_split_tile_size
             )
 
         if self.split_tile_size is not None:
+            # A fixed split tile also owns max_kv_splits; the policy defers to it.
+            self.splitkv_policy = False
             self.max_kv_splits = (
                 self.max_context_len + self.split_tile_size - 1
             ) // self.split_tile_size
@@ -333,6 +374,10 @@ class TritonAttnBackend(AttentionBackend):
             ) // self.split_tile_size
             return
 
+        if self.splitkv_policy:
+            self._get_num_kv_splits_policy(num_kv_splits, seq_lens, num_group)
+            return
+
         if num_seq < 256:
             SCHEDULE_SEQ = 256
         else:
@@ -349,6 +394,69 @@ class TritonAttnBackend(AttentionBackend):
             self.device_core_count,
             MAX_NUM_SEQ=SCHEDULE_SEQ,
         )
+
+    def _get_num_kv_splits_policy(
+        self,
+        num_kv_splits: torch.Tensor,
+        seq_lens: torch.Tensor,
+        num_group: int,
+    ):
+        """Cost-model split policy: size each request's splits from its own KV
+        length so per-CU work is even and long-context requests fan out.
+
+        Writes in place into ``num_kv_splits`` (same shape/dtype/address the
+        captured graph reads) with values clamped to ``[1, self.max_kv_splits]``
+        -- the grid split-dim and every mid-buffer are already sized for
+        ``self.max_kv_splits``, so this never changes shapes or grid dims at
+        replay. Feeds both the triton grouped kernel and the g4 HIP shim (which
+        read ``num_kv_splits[b]`` and early-out on empty splits identically).
+
+        Formula. Let ``per_seq_wg`` be the number of split-workgroups one
+        request launches per split (the grid's non-split factor: the grouped
+        triton kernel and the g4 kernel both launch ``cdiv(q_heads, block_h)``
+        == ``kv_heads`` workgroups per (request, split) for these shapes). We
+        pick a single chunk length so the batch's total active workgroups hit
+        ``_SPLITKV_CU_MULT x device_core_count``::
+
+            chunk = round_up(sum(seq_lens) * per_seq_wg / W_target, MIN_BLOCK_KV)
+            splits[b] = clip(cdiv(seq_lens[b], chunk), 1, max_kv_splits)
+
+        Each split then covers ~``chunk`` tokens (even per-CU work, FlashInfer
+        length-balancing) and ``splits[b]`` grows with that request's context.
+        """
+        # Per-(request, split) workgroup count. The grouped triton kernel grid-Y
+        # is cdiv(q_heads, min(BLOCK_H=16, kv_group)); the g4 grid is
+        # (batch, kv_heads, splits). For GQA group <= 16 (all Gemma-4 shapes)
+        # both reduce to num_kv_head workgroups per request per split.
+        kv_group = max(1, self.num_head // max(1, self.num_kv_head))
+        block_h = min(16, kv_group)
+        per_seq_wg = max(1, triton.cdiv(self.num_head, block_h))
+
+        w_target = max(1, _SPLITKV_CU_MULT * self.device_core_count)
+        # Total KV work this step (host-free: reduce on device).
+        total_kv = seq_lens.to(torch.int64).sum()
+        num_seq = seq_lens.shape[0]
+        # chunk sized so sum_b cdiv(seq,chunk) * per_seq_wg ~= w_target, rounded
+        # up to MIN_BLOCK_KV and floored at MIN_BLOCK_KV so a split is never a
+        # sub-tile. Kept on-device (int tensor) to stay cuda-graph capturable.
+        raw_chunk = (total_kv * per_seq_wg + w_target - 1) // w_target
+        chunk = torch.clamp(
+            (raw_chunk + _SPLITKV_MIN_BLOCK_KV - 1)
+            // _SPLITKV_MIN_BLOCK_KV
+            * _SPLITKV_MIN_BLOCK_KV,
+            min=_SPLITKV_MIN_BLOCK_KV,
+        )
+        splits = torch.clamp(
+            (seq_lens.to(torch.int64) + chunk - 1) // chunk,
+            min=1,
+            max=self.max_kv_splits,
+        ).to(torch.int32)
+
+        if num_group > 1:
+            # Match get_num_kv_splits_triton's group-contiguous layout:
+            # num_kv_splits[i + seq*num_group] for i in [0, num_group).
+            splits = splits.repeat_interleave(num_group)
+        num_kv_splits[: num_seq * num_group] = splits
 
     def _dcp_lens(self, lens: torch.Tensor, start: Optional[torch.Tensor] = None):
         return get_dcp_lens(lens, self.dcp_size, self.dcp_rank, start)
