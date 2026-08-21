@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+import logging
+import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, Optional
 
 import torch
 import triton
+
+logger = logging.getLogger(__name__)
 
 from sglang.kernels.ops.attention.metadata import get_num_kv_splits_triton
 from sglang.kernels.ops.kvcache.kv_indices import (
@@ -71,23 +75,70 @@ _MLA_DECODE_MIN_BLOCK_KV = 32
 
 # CAI split-KV load-balancing policy (SGLANG_G4_SPLITKV_POLICY, default OFF).
 # Gemma-4 GLOBAL layers have only 2 (26b) / 4 (31b) KV heads at head_dim 512;
-# at decode bs 256-768 the stock get_num_kv_splits under-fills the 304-CU
-# gfx942 GPU and splits uniformly rather than proportionally to context length,
-# so a lone 32k request serializes while short ones idle CUs. The policy sizes
-# each request's splits from a cost-model chunk chosen to fill ~SPLITKV_CU_MULT
-# co-resident split-workgroups per CU, capped higher for few-KV-head shapes.
+# at decode bs 256-768 the stock get_num_kv_splits splits uniformly rather than
+# proportionally to context length. The policy sizes each request's splits from
+# a cost-model chunk chosen to fill ~CU_MULT co-resident split-workgroups per
+# CU, capped higher for few-KV-head shapes.
+#
+# MEASURED (MI325X, test_g4_attn --bench): extra splits REGRESS the FULL/global
+# shape on both triton and g4 (stage-2 combine + partial-output traffic outweigh
+# the occupancy gain) but WIN ~6% on the window-capped SWA shape. Hence the
+# scope knob below defaults to "all" for A/B but "swa" is the measured winner.
+# All knobs are env-overridable at init (resolved into _SplitKVConfig) so the
+# constants can be swept without editing this file.
 _SPLITKV_MIN_BLOCK_KV = 32
 # Target co-resident split-workgroups per CU (2-4x the CU count in total).
 _SPLITKV_CU_MULT = 3
-# Raised per-request split cap for the few-KV-head (<=4) global shape; the
-# stock triton_attention_num_kv_splits cap (typically 16) stays the ceiling for
-# everything else.
+# KV-head count at/below which a shape is treated as "few-KV-head" (global).
 _SPLITKV_FEW_KV_HEAD = 4
+# Raised per-request split cap for the few-KV-head global shape; the stock
+# triton_attention_num_kv_splits cap (typically 16) stays the ceiling otherwise.
 _SPLITKV_FEW_KV_HEAD_MAX_SPLITS = 64
+# Scope: which decode shapes the per-request policy applies to.
+#   "all"  - every decode shape (default; preserves prior behavior)
+#   "swa"  - only window-capped (sliding-window) KV lengths; the measured winner
+#   "full" - only the non-window (global/full-attn) shapes
+_SPLITKV_SCOPE_DEFAULT = "all"
+_SPLITKV_SCOPES = ("all", "swa", "full")
 
 
 def _splitkv_policy_enabled() -> bool:
     return get_bool_env_var("SGLANG_G4_SPLITKV_POLICY", "false")
+
+
+@dataclass
+class _SplitKVConfig:
+    """Resolved split-KV policy knobs (env-overridable, read once at init)."""
+
+    cu_mult: int
+    min_block_kv: int
+    fewkv_max_splits: int
+    scope: str
+
+
+def _resolve_splitkv_config() -> "_SplitKVConfig":
+    scope = os.environ.get("SGLANG_G4_SPLITKV_SCOPE", _SPLITKV_SCOPE_DEFAULT).lower()
+    if scope not in _SPLITKV_SCOPES:
+        logger.warning(
+            "SGLANG_G4_SPLITKV_SCOPE=%r not in %s; using %r",
+            scope,
+            _SPLITKV_SCOPES,
+            _SPLITKV_SCOPE_DEFAULT,
+        )
+        scope = _SPLITKV_SCOPE_DEFAULT
+    return _SplitKVConfig(
+        cu_mult=max(1, get_int_env_var("SGLANG_G4_SPLITKV_CU_MULT", _SPLITKV_CU_MULT)),
+        min_block_kv=max(
+            1, get_int_env_var("SGLANG_G4_SPLITKV_MIN_BLOCK", _SPLITKV_MIN_BLOCK_KV)
+        ),
+        fewkv_max_splits=max(
+            1,
+            get_int_env_var(
+                "SGLANG_G4_SPLITKV_MAX_SPLITS_FEWKV", _SPLITKV_FEW_KV_HEAD_MAX_SPLITS
+            ),
+        ),
+        scope=scope,
+    )
 
 
 def _mla_decode_kv_splits_cap(
@@ -259,6 +310,7 @@ class TritonAttnBackend(AttentionBackend):
         self.splitkv_policy = (
             _splitkv_policy_enabled() and not self.use_mla and not _is_xpu
         )
+        self.splitkv_config = _resolve_splitkv_config()
         # Raise the cap for the few-KV-head global shape. self.num_kv_head is the
         # model's standard num_key_value_heads, which for hybrid Gemma-4 is the
         # SWA-layer count (8/16) -- the GLOBAL layers that actually have <=4 KV
@@ -268,13 +320,32 @@ class TritonAttnBackend(AttentionBackend):
         # model, which has a low-KV-head global layer by construction. The SWA
         # layers share the buffer but their window-capped KV (<=1024) yields few
         # splits, so the larger cap only costs a bigger mid-buffer, not wrong math.
+        # Skip the raise when scope=="swa": window-capped KV never exceeds the
+        # stock cap, so the larger mid-buffer would be pure waste.
         few_kv_head = (
             self.num_kv_head <= _SPLITKV_FEW_KV_HEAD
             or (self.sliding_window_size is not None and self.sliding_window_size > 0)
         )
-        if self.splitkv_policy and few_kv_head:
+        if (
+            self.splitkv_policy
+            and few_kv_head
+            and self.splitkv_config.scope != "swa"
+        ):
             self.max_kv_splits = max(
-                self.max_kv_splits, _SPLITKV_FEW_KV_HEAD_MAX_SPLITS
+                self.max_kv_splits, self.splitkv_config.fewkv_max_splits
+            )
+        if self.splitkv_policy:
+            logger.info(
+                "g4 split-KV policy ON: scope=%s cu_mult=%d min_block=%d "
+                "fewkv_max_splits=%d -> max_kv_splits=%d (num_kv_head=%d, "
+                "sliding_window=%s)",
+                self.splitkv_config.scope,
+                self.splitkv_config.cu_mult,
+                self.splitkv_config.min_block_kv,
+                self.splitkv_config.fewkv_max_splits,
+                self.max_kv_splits,
+                self.num_kv_head,
+                self.sliding_window_size,
             )
         if _is_cuda:
             self.use_pdl = is_arch_support_pdl()
@@ -359,6 +430,7 @@ class TritonAttnBackend(AttentionBackend):
         self,
         num_kv_splits: torch.Tensor,
         seq_lens: torch.Tensor,
+        is_window: bool = False,
     ):
         num_token, num_seq = num_kv_splits.shape[0], seq_lens.shape[0]
         # NOTE(alcanderian): Considering speculative_decodeing,
@@ -387,7 +459,12 @@ class TritonAttnBackend(AttentionBackend):
             ) // self.split_tile_size
             return
 
-        if self.splitkv_policy:
+        # Scope gate: the policy regresses the full/global shape and wins on the
+        # window-capped SWA shape (measured). is_window is the caller-supplied
+        # signal for "these lengths are window-capped" -- the cleanest available
+        # here, since the writer can't otherwise tell a full seq_len from a
+        # window-capped one. Out of scope -> fall through to the stock scheduler.
+        if self.splitkv_policy and self._splitkv_in_scope(is_window):
             self._get_num_kv_splits_policy(num_kv_splits, seq_lens, num_group)
             return
 
@@ -407,6 +484,17 @@ class TritonAttnBackend(AttentionBackend):
             self.device_core_count,
             MAX_NUM_SEQ=SCHEDULE_SEQ,
         )
+
+    def _splitkv_in_scope(self, is_window: bool) -> bool:
+        """Whether the cost-model policy applies to this call's lengths.
+        scope "all" -> always; "swa" -> only window-capped lengths; "full" ->
+        only non-window (global/full-attn) lengths."""
+        scope = self.splitkv_config.scope
+        if scope == "swa":
+            return is_window
+        if scope == "full":
+            return not is_window
+        return True
 
     def _get_num_kv_splits_policy(
         self,
@@ -429,7 +517,7 @@ class TritonAttnBackend(AttentionBackend):
         triton kernel and the g4 kernel both launch ``cdiv(q_heads, block_h)``
         == ``kv_heads`` workgroups per (request, split) for these shapes). We
         pick a single chunk length so the batch's total active workgroups hit
-        ``_SPLITKV_CU_MULT x device_core_count``::
+        ``cu_mult x device_core_count``::
 
             chunk = round_up(sum(seq_lens) * per_seq_wg / W_target, MIN_BLOCK_KV)
             splits[b] = clip(cdiv(seq_lens[b], chunk), 1, max_kv_splits)
@@ -445,19 +533,19 @@ class TritonAttnBackend(AttentionBackend):
         block_h = min(16, kv_group)
         per_seq_wg = max(1, triton.cdiv(self.num_head, block_h))
 
-        w_target = max(1, _SPLITKV_CU_MULT * self.device_core_count)
+        cfg = self.splitkv_config
+        min_block = cfg.min_block_kv
+        w_target = max(1, cfg.cu_mult * self.device_core_count)
         # Total KV work this step (host-free: reduce on device).
         total_kv = seq_lens.to(torch.int64).sum()
         num_seq = seq_lens.shape[0]
         # chunk sized so sum_b cdiv(seq,chunk) * per_seq_wg ~= w_target, rounded
-        # up to MIN_BLOCK_KV and floored at MIN_BLOCK_KV so a split is never a
+        # up to min_block and floored at min_block so a split is never a
         # sub-tile. Kept on-device (int tensor) to stay cuda-graph capturable.
         raw_chunk = (total_kv * per_seq_wg + w_target - 1) // w_target
         chunk = torch.clamp(
-            (raw_chunk + _SPLITKV_MIN_BLOCK_KV - 1)
-            // _SPLITKV_MIN_BLOCK_KV
-            * _SPLITKV_MIN_BLOCK_KV,
-            min=_SPLITKV_MIN_BLOCK_KV,
+            (raw_chunk + min_block - 1) // min_block * min_block,
+            min=min_block,
         )
         splits = torch.clamp(
             (seq_lens.to(torch.int64) + chunk - 1) // chunk,
@@ -898,7 +986,9 @@ class TritonAttnBackend(AttentionBackend):
                     window_num_kv_splits = torch.empty(
                         (bs,), dtype=torch.int32, device=self.device
                     )
-                    self.get_num_kv_splits(window_num_kv_splits, window_kv_lens)
+                    self.get_num_kv_splits(
+                        window_num_kv_splits, window_kv_lens, is_window=True
+                    )
             else:
                 kv_indptr, kv_indices = spec_info.kv_indptr, spec_info.kv_indices
                 bs = kv_indptr.shape[0] - 1
@@ -1324,7 +1414,9 @@ class TritonAttnBackend(AttentionBackend):
             )
             if window_kv_lens is not None:
                 self.get_num_kv_splits(
-                    self.cuda_graph_window_num_kv_splits[:bs], window_kv_lens[:bs]
+                    self.cuda_graph_window_num_kv_splits[:bs],
+                    window_kv_lens[:bs],
+                    is_window=True,
                 )
         elif forward_mode.is_target_verify():
             bs = len(req_pool_indices)
