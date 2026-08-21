@@ -259,7 +259,20 @@ class TritonAttnBackend(AttentionBackend):
         self.splitkv_policy = (
             _splitkv_policy_enabled() and not self.use_mla and not _is_xpu
         )
-        if self.splitkv_policy and self.num_kv_head <= _SPLITKV_FEW_KV_HEAD:
+        # Raise the cap for the few-KV-head global shape. self.num_kv_head is the
+        # model's standard num_key_value_heads, which for hybrid Gemma-4 is the
+        # SWA-layer count (8/16) -- the GLOBAL layers that actually have <=4 KV
+        # heads (2 on 26b, 4 on 31b) are not visible here (per-layer geometry is
+        # only known at dispatch via k_buffer.shape[-2]). So trigger the raise
+        # either on a directly low head count OR on any sliding-window (hybrid)
+        # model, which has a low-KV-head global layer by construction. The SWA
+        # layers share the buffer but their window-capped KV (<=1024) yields few
+        # splits, so the larger cap only costs a bigger mid-buffer, not wrong math.
+        few_kv_head = (
+            self.num_kv_head <= _SPLITKV_FEW_KV_HEAD
+            or (self.sliding_window_size is not None and self.sliding_window_size > 0)
+        )
+        if self.splitkv_policy and few_kv_head:
             self.max_kv_splits = max(
                 self.max_kv_splits, _SPLITKV_FEW_KV_HEAD_MAX_SPLITS
             )
