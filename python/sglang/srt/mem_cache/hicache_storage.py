@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import mmap
 import os
 import threading
 import time
@@ -357,6 +358,16 @@ class MetadataCache:
             self.cache.clear()
 
 
+# O_DIRECT write alignment. O_DIRECT requires the buffer address, file offset,
+# and transfer length to all be multiples of the device logical block size;
+# 4096 is a safe superset of 512/4096-sector devices.
+_HICACHE_DIO_ALIGN = 4096
+
+
+def _align_up(n: int, a: int) -> int:
+    return (n + a - 1) // a * a
+
+
 class HiCacheFile(HiCacheStorage):
 
     def __init__(
@@ -410,6 +421,30 @@ class HiCacheFile(HiCacheStorage):
         self._fadvise_ring_size = int(
             os.environ.get("SGLANG_HICACHE_FILE_DROP_CACHE_LAG_FILES", "256")
         )
+
+        # O_DIRECT writes bypass the page cache entirely. Under a slow storage
+        # backend (e.g. a transiently throttled virtio/network-backed volume),
+        # buffered L3 writes accumulate as writeback pages inside the pod's
+        # memory cgroup - which sits pinned at memory.max because the L2 host
+        # pool fills it - so allocations pod-wide enter direct reclaim and the
+        # scheduler blocks in an uninterruptible D-state for tens of seconds
+        # (2026-08-23 03:35Z 31b freeze; reproduced under an io.max drain cap,
+        # p99 4.9->15.1s + a 13.8s freeze, and eliminated by O_DIRECT: p99 5.2s,
+        # zero freezes, zero writeback backlog). fadvise (above) only helps
+        # while the device drains fast enough to keep the backlog small; when
+        # it doesn't, only skipping the page cache removes the failure mode.
+        # Off by default (the fadvise path is fine on healthy storage and
+        # O_DIRECT needs a backing fs that supports it); enabled per-model.
+        self._o_direct = (
+            os.environ.get("SGLANG_HICACHE_FILE_O_DIRECT", "0") == "1"
+            and hasattr(os, "O_DIRECT")
+        )
+        # Per-thread reusable page-aligned bounce buffer (anonymous mmap is
+        # page-aligned by construction), grown to the largest page seen so we
+        # don't mmap/free on every write.
+        self._odirect_tls = threading.local()
+        if self._o_direct:
+            logger.info("HiCacheFile: O_DIRECT writes enabled (page cache bypassed)")
 
         # Metadata cache positive lookup toggle & TTL
         enable_cache_raw = None
@@ -537,8 +572,15 @@ class HiCacheFile(HiCacheStorage):
         reserved = False
         try:
             value_bytes = value.numel() * value.element_size()
+            # O_DIRECT zero-pads the file up to the block size, so reserve the
+            # rounded size to keep the evictor's disk accounting honest.
+            reserve_bytes = (
+                _align_up(value_bytes, _HICACHE_DIO_ALIGN)
+                if self._o_direct
+                else value_bytes
+            )
             # Ask the evictor to admit + reserve disk space (evicting if needed).
-            if not self._evictor.reserve(suffixed, value_bytes, key=key):
+            if not self._evictor.reserve(suffixed, reserve_bytes, key=key):
                 return False
             reserved = True
 
@@ -547,7 +589,9 @@ class HiCacheFile(HiCacheStorage):
                 f"{os.getpid()}.{threading.get_ident()}.{uuid.uuid4().hex}"
             )
             data = value.contiguous().view(dtype=torch.uint8).numpy()
-            if self._drop_page_cache:
+            if self._o_direct:
+                self._write_odirect(tmp_path, data, value_bytes)
+            elif self._drop_page_cache:
                 fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
                 try:
                     os.write(fd, memoryview(data))
@@ -559,7 +603,8 @@ class HiCacheFile(HiCacheStorage):
             else:
                 data.tofile(tmp_path)
             os.replace(tmp_path, tensor_path)
-            if self._drop_page_cache:
+            # O_DIRECT leaves no page-cache pages, so the fadvise passes are moot.
+            if self._drop_page_cache and not self._o_direct:
                 self._fadvise_lagged_drop(tensor_path)
             self._evictor.commit(suffixed)
             if self.metadata_cache is not None:
@@ -578,6 +623,56 @@ class HiCacheFile(HiCacheStorage):
             if self.metadata_cache is not None:
                 self.metadata_cache.remove(suffixed)
             return False
+
+    def _odirect_buffer(self, need: int) -> mmap.mmap:
+        """Per-thread page-aligned bounce buffer, grown to `need` (already
+        block-rounded by the caller). Anonymous mmap is page-aligned, which
+        satisfies the O_DIRECT buffer-address constraint; reused across writes
+        so we don't mmap/munmap per page."""
+        buf = getattr(self._odirect_tls, "buf", None)
+        if buf is None or getattr(self._odirect_tls, "cap", 0) < need:
+            if buf is not None:
+                buf.close()
+            self._odirect_tls.buf = mmap.mmap(-1, need)
+            self._odirect_tls.cap = need
+        return self._odirect_tls.buf
+
+    def _write_odirect(self, tmp_path: str, data, nbytes: int) -> None:
+        """Write `data` (contiguous uint8) with O_DIRECT, bypassing the page
+        cache. The file is zero-padded up to the block size; the reader reads
+        exactly numel*element_size bytes via readinto(), so the padding is
+        invisible. Falls back to a buffered write (once, permanently) if the
+        backing filesystem rejects O_DIRECT."""
+        padded = _align_up(nbytes, _HICACHE_DIO_ALIGN)
+        buf = self._odirect_buffer(padded)
+        buf[:nbytes] = memoryview(data).cast("B").tobytes()
+        if padded > nbytes:
+            buf[nbytes:padded] = b"\x00" * (padded - nbytes)
+        try:
+            fd = os.open(
+                tmp_path,
+                os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_DIRECT,
+                0o644,
+            )
+        except OSError as e:
+            logger.warning(
+                f"HiCacheFile: O_DIRECT open failed ({e}); "
+                f"falling back to buffered writes"
+            )
+            self._o_direct = False
+            data.tofile(tmp_path)
+            return
+        try:
+            mv = memoryview(buf)
+            try:
+                off = 0
+                while off < padded:
+                    off += os.write(fd, mv[off:padded])
+            finally:
+                # Release before any close of the mmap or it raises BufferError.
+                mv.release()
+        finally:
+            os.close(fd)
 
     def _fadvise_lagged_drop(self, path: str) -> None:
         """Pass 2 of the cache-drop: re-fadvise a file written ~ring-size ago.
