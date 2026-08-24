@@ -12,9 +12,6 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import maybe_stub_sgl_kernel
-
-maybe_stub_sgl_kernel()
 
 import torch
 
