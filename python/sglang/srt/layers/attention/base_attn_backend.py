@@ -6,7 +6,6 @@ from typing import TYPE_CHECKING, Optional
 import torch
 
 from sglang.kernel_api_logging import debug_kernel_api
-from sglang.srt.utils.common import is_npu
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.dsa.dsa_indexer_metadata import (
@@ -46,6 +45,12 @@ class AttentionBackend(ABC):
     decode_attention_backend_str: Optional[str] = None
 
     supports_ragged_verify_graph: bool = False
+
+    # Set (per instance) by backends that implement forward_mixed(); MIXED
+    # batches then dispatch there instead of folding the 1-token decode rows
+    # into forward_extend. Consumers: the Ascend NPU backend (upstream, not in
+    # this fork) and the Triton backend's mixed split dispatch.
+    supports_forward_mixed: bool = False
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Eager entry point. Default = ``_out_graph(fb) + _in_graph(fb)``.
@@ -209,7 +214,7 @@ class AttentionBackend(ABC):
                 save_kv_cache=save_kv_cache,
                 **kwargs,
             )
-        elif forward_batch.forward_mode.is_mixed() and is_npu():
+        elif forward_batch.forward_mode.is_mixed() and self.supports_forward_mixed:
             return self.forward_mixed(
                 q,
                 k,

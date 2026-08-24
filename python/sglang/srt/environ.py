@@ -933,6 +933,15 @@ class Envs:
     # extend_attention_fwd for unsupported cases or when set false (e.g. for
     # debugging). Correctness is unaffected; this only changes performance.
     SGLANG_ENABLE_SPLITKV_VERIFY = EnvBool(True)
+    # Mixed-batch (--enable-mixed-chunk) split dispatch on the Triton backend:
+    # route the trailing 1-token decode rows of a MIXED batch through the
+    # grouped decode kernels (GQA-amortized, split-KV, pre-windowed SWA
+    # indices) instead of folding them into the extend kernel as 1-token
+    # varlen rows, which re-read their whole KV prefix at ~1/GQA-tile
+    # efficiency (~4x per-decode-token on Gemma-4). Kill switch for A/B: set 0
+    # to restore fold-into-extend. Only affects MIXED batches; each sub-call
+    # uses the identical kernels of a pure decode / pure extend step.
+    SGLANG_TRITON_MIXED_SPLIT_DISPATCH = EnvBool(True)
     # Hard cap on the torch caching allocator's total RESERVED device memory,
     # as a fraction of the device (torch.cuda.set_per_process_memory_fraction;
     # see model_executor/allocator_guard.py for the full rationale). Keeps

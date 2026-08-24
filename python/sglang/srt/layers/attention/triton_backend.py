@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import logging
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, replace as dataclass_replace
 from typing import TYPE_CHECKING, List, Optional
 
+import msgspec
 import torch
 import triton
 
@@ -182,6 +183,53 @@ class ForwardMetadata:
     # PHYSICAL full-attn write target for the unified pool (eager: translated tensor;
     # cuda-graph: capture-stable buffer view). None for non-unified pools.
     out_cache_loc_full_physical: Optional[torch.Tensor] = None
+    # Split-dispatch views for a MIXED batch (see MixedSplitMetadata). None
+    # outside MIXED mode or when split dispatch is off/unavailable.
+    mixed_split: Optional["MixedSplitMetadata"] = None
+
+
+class MixedSplitMetadata(msgspec.Struct):
+    """Per-step split-dispatch views for a MIXED (--enable-mixed-chunk) batch.
+
+    ``mix_with_running`` packs a MIXED batch as multi-token prefill rows
+    followed by the running decodes as trailing 1-token rows, so the split is
+    two contiguous slices:
+
+    - ``prefill``: the step's extend metadata with its row-indexed indptr
+      tensors sliced to the leading ``n_prefill`` rows (the extend kernel only
+      reads through ``qo_indptr[n_prefill]``, so the shared flat kv_indices /
+      window tensors need no copy). KV-write fields stay whole-batch: the
+      extend sub-call's save covers every row, including the decode rows'
+      current tokens.
+    - ``decode``: standard decode-mode metadata built over the trailing
+      1-token rows (full seq_lens incl. the current token, windowed SWA
+      indices, split-KV policy, fresh mid-buffers) — the decode sub-call is
+      kernel-identical to a pure decode step at that batch size.
+    - ``prefill_token_end``: first decode row's offset in the packed token
+      dim; ``q[prefill_token_end:]`` is the decode sub-batch (one row each).
+    """
+
+    prefill: ForwardMetadata
+    decode: ForwardMetadata
+    prefill_token_end: int
+
+
+def mixed_decode_suffix_start(extend_seq_lens_cpu) -> int:
+    """First row of the trailing run of 1-token rows in a MIXED batch.
+
+    ``mix_with_running`` appends the running (decode) requests after the
+    prefill rows, so the mixed-in decodes are always a suffix of 1-token rows.
+    A 1-token *prefill* row (e.g. a chunked request's final 1-token chunk)
+    that abuts the suffix is classified into it too — that is correct: a
+    1-token extend row computes exactly decode attention (its query attends
+    prefix + itself, whose KV is written before any kernel runs). The suffix
+    is capped at len-1 rows so the extend sub-call keeps >= 1 row: it owns the
+    whole-batch KV-cache save.
+    """
+    n_prefill = len(extend_seq_lens_cpu)
+    while n_prefill > 1 and extend_seq_lens_cpu[n_prefill - 1] == 1:
+        n_prefill -= 1
+    return n_prefill
 
 
 class TritonAttnBackend(AttentionBackend):
@@ -388,6 +436,28 @@ class TritonAttnBackend(AttentionBackend):
             self.max_kv_splits = (
                 self.max_context_len + self.split_tile_size - 1
             ) // self.split_tile_size
+
+        # CAI mixed split dispatch (--enable-mixed-chunk): serve the 1-token
+        # decode suffix of a MIXED batch with the decode kernels instead of
+        # folding it into the extend kernel (where 1-token varlen rows lose GQA
+        # amortization and split-KV: ~4x per-decode-token on Gemma-4).
+        # forward_mixed() is the entry point; SGLANG_TRITON_MIXED_SPLIT_DISPATCH
+        # is the kill switch (A/B vs fold-into-extend). Deterministic mode keeps
+        # its unified single-kernel extend path; the MLA and DCP decode
+        # contracts differ from the plain grouped-decode call made here, so all
+        # three fall back to fold-into-extend.
+        self.mixed_split_dispatch = (
+            envs.SGLANG_TRITON_MIXED_SPLIT_DISPATCH.get()
+            and not skip_prefill
+            and not self.use_mla
+            and self.dcp_size == 1
+            and not self.enable_deterministic
+        )
+        self.supports_forward_mixed = self.mixed_split_dispatch
+        # One boot-log line on first engagement so activation is verifiable
+        # from serving logs (a silent-inert gate is indistinguishable from a
+        # working one otherwise).
+        self._mixed_split_logged = False
 
         assert not (
             model_runner.sliding_window_size is not None
@@ -1184,6 +1254,168 @@ class TritonAttnBackend(AttentionBackend):
             swa_attn_logits=swa_attn_logits,
             swa_out_cache_loc=swa_out_cache_loc,
             out_cache_loc_full_physical=out_cache_loc_full_physical,
+        )
+
+        if (
+            forward_batch.forward_mode.is_mixed()
+            and self.mixed_split_dispatch
+            and spec_info is None
+        ):
+            self.forward_metadata.mixed_split = self._build_mixed_split_metadata(
+                forward_batch
+            )
+
+    def _build_mixed_split_metadata(
+        self, forward_batch: ForwardBatch
+    ) -> Optional[MixedSplitMetadata]:
+        """Build the prefill/decode split views for a MIXED batch.
+
+        Returns None (-> forward_mixed folds into extend, today's behavior)
+        when the CPU extend-length lists are absent (gpu-only metadata: the
+        split points would cost a device sync) or the batch has no 1-token
+        suffix. Sync-free otherwise: every size below comes from the CPU lists.
+        """
+        extend_seq_lens_cpu = forward_batch.extend_seq_lens_cpu
+        extend_prefix_lens_cpu = forward_batch.extend_prefix_lens_cpu
+        if extend_seq_lens_cpu is None or extend_prefix_lens_cpu is None:
+            return None
+        bs = len(extend_seq_lens_cpu)
+        n_prefill = mixed_decode_suffix_start(extend_seq_lens_cpu)
+        if n_prefill == bs:
+            return None
+        metadata = self.forward_metadata
+        prefill = dataclass_replace(
+            metadata,
+            max_extend_len=max(extend_seq_lens_cpu[:n_prefill]),
+            qo_indptr=metadata.qo_indptr[: n_prefill + 1],
+            kv_indptr=metadata.kv_indptr[: n_prefill + 1],
+            window_kv_indptr=(
+                metadata.window_kv_indptr[: n_prefill + 1]
+                if metadata.window_kv_indptr is not None
+                else None
+            ),
+            mixed_split=None,
+        )
+        decode = self._build_mixed_decode_metadata(
+            forward_batch,
+            n_prefill=n_prefill,
+            n_decode=bs - n_prefill,
+            extend_prefix_lens_cpu=extend_prefix_lens_cpu,
+        )
+        return MixedSplitMetadata(
+            prefill=prefill,
+            decode=decode,
+            prefill_token_end=sum(extend_seq_lens_cpu[:n_prefill]),
+        )
+
+    def _build_mixed_decode_metadata(
+        self,
+        forward_batch: ForwardBatch,
+        *,
+        n_prefill: int,
+        n_decode: int,
+        extend_prefix_lens_cpu,
+    ) -> ForwardMetadata:
+        """Decode-mode metadata over a MIXED batch's trailing 1-token rows.
+
+        Mirrors the decode branch of init_forward_metadata at batch size
+        ``n_decode``. seq_lens here are the rows' FULL lengths (prefix + the
+        one in-chunk token): the token's KV is written to the pool by the
+        extend sub-call's whole-batch save before any attention kernel runs,
+        exactly like a pure decode step that writes KV first.
+        """
+        seq_lens = forward_batch.seq_lens[n_prefill:]
+        req_pool_indices = forward_batch.req_pool_indices[n_prefill:]
+        seq_lens_sum = sum(extend_prefix_lens_cpu[n_prefill:]) + n_decode
+
+        kv_indptr = torch.zeros(
+            n_decode + 1, dtype=torch.int32, device=self.device
+        )
+        kv_indptr[1:] = torch.cumsum(seq_lens, dim=0)
+        kv_indices = torch.empty(
+            seq_lens_sum, dtype=torch.int64, device=self.device
+        )
+        create_flashinfer_kv_indices_triton[(n_decode,)](
+            self.req_to_token,
+            req_pool_indices,
+            seq_lens,
+            kv_indptr,
+            None,
+            kv_indices,
+            self.req_to_token.stride(0),
+        )
+        if self._translate_kv_loc is not None:
+            kv_indices = self._translate_kv_loc(kv_indices)
+
+        window_kv_indptr = None
+        window_kv_indices = None
+        window_num_kv_splits = None
+        if self.sliding_window_size is not None and self.sliding_window_size > 0:
+            window_total_cpu = sum(
+                min(int(p) + 1, self.sliding_window_size)
+                for p in extend_prefix_lens_cpu[n_prefill:]
+            )
+            window_kv_indptr, window_kv_indices, window_kv_lens, _ = (
+                update_sliding_window_buffer(
+                    torch.zeros(n_decode + 1, dtype=torch.int32, device=self.device),
+                    self.req_to_token,
+                    self.sliding_window_size,
+                    seq_lens,
+                    req_pool_indices,
+                    n_decode,
+                    self.device,
+                    self.token_to_kv_pool,
+                    window_kv_total_cpu=window_total_cpu,
+                )
+            )
+            window_num_kv_splits = torch.empty(
+                (n_decode,), dtype=torch.int32, device=self.device
+            )
+            self.get_num_kv_splits(
+                window_num_kv_splits, window_kv_lens, is_window=True
+            )
+
+        attn_logits = torch.empty(
+            (n_decode, self.num_head, self.max_kv_splits, self.v_head_dim),
+            dtype=torch.float32,
+            device=self.device,
+        )
+        swa_attn_logits = None
+        if self.swa_v_head_dim is not None:
+            swa_attn_logits = torch.empty(
+                (n_decode, self.num_head, self.max_kv_splits, self.swa_v_head_dim),
+                dtype=torch.float32,
+                device=self.device,
+            )
+        attn_lse = torch.empty(
+            (n_decode, self.num_head, self.max_kv_splits),
+            dtype=torch.float32,
+            device=self.device,
+        )
+        num_kv_splits = torch.empty(
+            (n_decode,), dtype=torch.int32, device=self.device
+        )
+        self.get_num_kv_splits(num_kv_splits, seq_lens)
+
+        return ForwardMetadata(
+            attn_logits,
+            attn_lse,
+            None,  # max_extend_len (extend-only)
+            num_kv_splits,
+            kv_indptr,
+            kv_indices,
+            None,  # qo_indptr (extend-only)
+            None,  # custom_mask
+            None,  # mask_indptr
+            window_kv_indptr,
+            window_kv_indices,
+            window_num_kv_splits,
+            None,  # window_kv_offsets (extend-only)
+            swa_attn_logits=swa_attn_logits,
+            # KV-write fields deliberately None: the decode sub-call runs with
+            # save_kv_cache=False (the extend sub-call already saved all rows).
+            swa_out_cache_loc=None,
+            out_cache_loc_full_physical=None,
         )
 
     def init_cuda_graph_state(
@@ -2102,6 +2334,98 @@ class TritonAttnBackend(AttentionBackend):
             score_mod=score_mod,
             aux_tensors=aux_tensors,
         )
+        return o
+
+    def forward_mixed(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        save_kv_cache=True,
+        sinks=None,
+        score_mod=None,
+        aux_tensors=None,
+    ):
+        """Split dispatch for a MIXED (--enable-mixed-chunk) batch.
+
+        The batch is a varlen pack of multi-token prefill rows followed by the
+        running decodes as 1-token rows. Folding those rows into the extend
+        kernel loses the grouped decode kernel's GQA amortization and split-KV
+        (each 1-token row re-scans its whole KV prefix), so serve the two
+        slices with their native kernels: forward_extend over the prefill
+        prefix, forward_decode over the decode suffix. Each sub-call sees a
+        subset view of the step metadata (built once per step in
+        init_forward_metadata); outputs land in disjoint row ranges of one
+        output tensor. Falls back to fold-into-extend when the split metadata
+        is unavailable (kill switch off, spec/MLA/DCP/deterministic, or
+        gpu-only metadata without CPU extend lens).
+        """
+        mixed_split = self.forward_metadata.mixed_split
+        if mixed_split is None:
+            return self.forward_extend(
+                q,
+                k,
+                v,
+                layer,
+                forward_batch,
+                save_kv_cache=save_kv_cache,
+                sinks=sinks,
+                score_mod=score_mod,
+                aux_tensors=aux_tensors,
+            )
+
+        if not self._mixed_split_logged:
+            self._mixed_split_logged = True
+            n_prefill = mixed_split.prefill.qo_indptr.shape[0] - 1
+            n_decode = mixed_split.decode.kv_indptr.shape[0] - 1
+            logger.info(
+                "Triton mixed split dispatch ACTIVE: first MIXED batch has "
+                "%d prefill rows (%d tokens) + %d decode rows.",
+                n_prefill,
+                mixed_split.prefill_token_end,
+                n_decode,
+            )
+
+        full_metadata = self.forward_metadata
+        # Extend over the prefill prefix. Its KV-cache save spans the WHOLE
+        # batch (out_cache_loc covers all rows), which is what puts the decode
+        # rows' current-token KV in the pool before the decode kernel reads it.
+        self.forward_metadata = mixed_split.prefill
+        try:
+            o = self.forward_extend(
+                q,
+                k,
+                v,
+                layer,
+                forward_batch,
+                save_kv_cache=save_kv_cache,
+                sinks=sinks,
+                score_mod=score_mod,
+                aux_tensors=aux_tensors,
+            )
+        finally:
+            self.forward_metadata = full_metadata
+
+        token_split = mixed_split.prefill_token_end
+        self.forward_metadata = mixed_split.decode
+        try:
+            o_decode = self.forward_decode(
+                q[token_split:],
+                k[token_split:] if k is not None else None,
+                v[token_split:] if v is not None else None,
+                layer,
+                forward_batch,
+                save_kv_cache=False,  # saved above for the whole batch
+                sinks=sinks,
+                score_mod=score_mod,
+                aux_tensors=aux_tensors,
+            )
+        finally:
+            self.forward_metadata = full_metadata
+
+        o[token_split:] = o_decode.view(o[token_split:].shape)
         return o
 
 
