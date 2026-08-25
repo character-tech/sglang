@@ -17,6 +17,7 @@ import torch
 
 from sglang.srt.layers.attention.triton_backend import (
     ForwardMetadata,
+    MixedDecodeBuffers,
     MixedSplitMetadata,
     TritonAttnBackend,
     mixed_decode_suffix_start,
@@ -134,6 +135,48 @@ class TestBuildMixedSplitMetadata(unittest.TestCase):
         kwargs = build_decode.call_args.kwargs
         self.assertEqual(kwargs["n_prefill"], 2)
         self.assertEqual(kwargs["n_decode"], 3)
+
+
+class TestMixedDecodeBuffers(unittest.TestCase):
+    """The mid-buffers must be allocated once and row-sliced per step —
+    per-step allocation is what exhausted HBM in the 2026-08-25 incident."""
+
+    def _backend(self, *, swa: bool) -> TritonAttnBackend:
+        backend = TritonAttnBackend.__new__(TritonAttnBackend)
+        backend.device = "cpu"
+        backend.num_head = 16
+        backend.max_kv_splits = 16
+        backend.v_head_dim = 512
+        backend.swa_v_head_dim = 256 if swa else None
+        return backend
+
+    def test_alloc_shapes_and_indptr_base(self):
+        backend = self._backend(swa=True)
+        buffers = backend._alloc_mixed_decode_buffers(640)
+        self.assertIsInstance(buffers, MixedDecodeBuffers)
+        self.assertEqual(buffers.attn_logits.shape, (640, 16, 16, 512))
+        self.assertEqual(buffers.swa_attn_logits.shape, (640, 16, 16, 256))
+        self.assertEqual(buffers.attn_lse.shape, (640, 16, 16))
+        self.assertEqual(buffers.kv_indptr.shape, (641,))
+        # Element 0 is the cumsum base; zeros-init and never rewritten.
+        self.assertEqual(int(buffers.kv_indptr[0]), 0)
+        self.assertEqual(int(buffers.window_kv_indptr[0]), 0)
+        self.assertEqual(buffers.kv_indptr.dtype, torch.int32)
+        self.assertEqual(buffers.num_kv_splits.dtype, torch.int32)
+
+    def test_no_swa_variant_and_slice_strides(self):
+        backend = self._backend(swa=False)
+        buffers = backend._alloc_mixed_decode_buffers(64)
+        self.assertIsNone(buffers.swa_attn_logits)
+        # A row-sliced view must share storage (no copy) and keep the strides
+        # of a same-shape contiguous tensor — the kernels read strides off it.
+        view = buffers.attn_logits[:7]
+        self.assertEqual(
+            view.data_ptr(), buffers.attn_logits.data_ptr()
+        )
+        self.assertEqual(
+            view.stride(), torch.empty(7, 16, 16, 512).stride()
+        )
 
 
 class TestForwardMixed(unittest.TestCase):

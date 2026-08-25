@@ -188,6 +188,28 @@ class ForwardMetadata:
     mixed_split: Optional["MixedSplitMetadata"] = None
 
 
+class MixedDecodeBuffers(msgspec.Struct):
+    """Persistent mid-buffers for the decode sub-call of MIXED batches,
+    allocated ONCE (max-batch-sized) and row-sliced per step.
+
+    Per-step allocation of these buffers is what exhausted HBM in the
+    2026-08-25 mixed-chunk experiment: every mixed step allocated ~0.5 GB of
+    freshly-SHAPED tensors (attn_logits et al. sized to that step's decode
+    row count, which grows with load), churning the caching allocator on top
+    of the 16k-chunk activation transients until free memory hit 0
+    (HSA_STATUS_ERROR_OUT_OF_RESOURCES, 7/10 pods within 50s). A single
+    max-sized allocation at boot caps the footprint and removes the churn.
+    """
+
+    attn_logits: torch.Tensor
+    attn_lse: torch.Tensor
+    kv_indptr: torch.Tensor
+    window_kv_indptr: torch.Tensor
+    num_kv_splits: torch.Tensor
+    window_num_kv_splits: torch.Tensor
+    swa_attn_logits: Optional[torch.Tensor] = None
+
+
 class MixedSplitMetadata(msgspec.Struct):
     """Per-step split-dispatch views for a MIXED (--enable-mixed-chunk) batch.
 
@@ -458,6 +480,15 @@ class TritonAttnBackend(AttentionBackend):
         # from serving logs (a silent-inert gate is indistinguishable from a
         # working one otherwise).
         self._mixed_split_logged = False
+        # Persistent decode mid-buffers for MIXED steps (see MixedDecodeBuffers
+        # for the incident record). Allocated at boot only when mixed batches
+        # can actually occur (--enable-mixed-chunk), so plain deployments pay
+        # nothing; boot-time allocation also means the ~0.5 GB is claimed while
+        # headroom is guaranteed, not mid-traffic. Lazy fallback in
+        # _build_mixed_decode_metadata covers any future MIXED producer.
+        self._mixed_decode_buffers: Optional[MixedDecodeBuffers] = None
+        if self.mixed_split_dispatch and model_runner.server_args.enable_mixed_chunk:
+            self._mixed_decode_buffers = self._alloc_mixed_decode_buffers(max_bs)
 
         assert not (
             model_runner.sliding_window_size is not None
@@ -1308,6 +1339,47 @@ class TritonAttnBackend(AttentionBackend):
             prefill_token_end=sum(extend_seq_lens_cpu[:n_prefill]),
         )
 
+    def _alloc_mixed_decode_buffers(self, max_bs: int) -> MixedDecodeBuffers:
+        """One-time, max-batch-sized mid-buffers for MIXED decode sub-calls.
+
+        ~0.5 GB at 640 slots x 16 heads x 16 splits x (512 + 256) fp32. The
+        indptr buffers are zeros so element 0 (never rewritten) stays a valid
+        cumsum base across reuse.
+        """
+        return MixedDecodeBuffers(
+            attn_logits=torch.empty(
+                (max_bs, self.num_head, self.max_kv_splits, self.v_head_dim),
+                dtype=torch.float32,
+                device=self.device,
+            ),
+            attn_lse=torch.empty(
+                (max_bs, self.num_head, self.max_kv_splits),
+                dtype=torch.float32,
+                device=self.device,
+            ),
+            kv_indptr=torch.zeros(
+                (max_bs + 1,), dtype=torch.int32, device=self.device
+            ),
+            window_kv_indptr=torch.zeros(
+                (max_bs + 1,), dtype=torch.int32, device=self.device
+            ),
+            num_kv_splits=torch.empty(
+                (max_bs,), dtype=torch.int32, device=self.device
+            ),
+            window_num_kv_splits=torch.empty(
+                (max_bs,), dtype=torch.int32, device=self.device
+            ),
+            swa_attn_logits=(
+                torch.empty(
+                    (max_bs, self.num_head, self.max_kv_splits, self.swa_v_head_dim),
+                    dtype=torch.float32,
+                    device=self.device,
+                )
+                if self.swa_v_head_dim is not None
+                else None
+            ),
+        )
+
     def _build_mixed_decode_metadata(
         self,
         forward_batch: ForwardBatch,
@@ -1323,14 +1395,27 @@ class TritonAttnBackend(AttentionBackend):
         one in-chunk token): the token's KV is written to the pool by the
         extend sub-call's whole-batch save before any attention kernel runs,
         exactly like a pure decode step that writes KV first.
+
+        Mid-buffers and row-indexed tensors are row-sliced views of the
+        persistent MixedDecodeBuffers — no per-step allocation (the 2026-08-25
+        HBM-exhaustion incident). Reuse across steps is safe for the same
+        reason self.kv_indptr's reuse is: metadata writes and the kernels that
+        read them are ordered on the same stream. Only kv_indices (variable
+        total length, same scale as the extend path's own per-step indices)
+        is still allocated per step.
         """
+        buffers = self._mixed_decode_buffers
+        if buffers is None:
+            buffers = self._alloc_mixed_decode_buffers(
+                self.req_to_token_pool.size
+            )
+            self._mixed_decode_buffers = buffers
+
         seq_lens = forward_batch.seq_lens[n_prefill:]
         req_pool_indices = forward_batch.req_pool_indices[n_prefill:]
         seq_lens_sum = sum(extend_prefix_lens_cpu[n_prefill:]) + n_decode
 
-        kv_indptr = torch.zeros(
-            n_decode + 1, dtype=torch.int32, device=self.device
-        )
+        kv_indptr = buffers.kv_indptr[: n_decode + 1]
         kv_indptr[1:] = torch.cumsum(seq_lens, dim=0)
         kv_indices = torch.empty(
             seq_lens_sum, dtype=torch.int64, device=self.device
@@ -1357,7 +1442,7 @@ class TritonAttnBackend(AttentionBackend):
             )
             window_kv_indptr, window_kv_indices, window_kv_lens, _ = (
                 update_sliding_window_buffer(
-                    torch.zeros(n_decode + 1, dtype=torch.int32, device=self.device),
+                    buffers.window_kv_indptr,
                     self.req_to_token,
                     self.sliding_window_size,
                     seq_lens,
@@ -1368,33 +1453,17 @@ class TritonAttnBackend(AttentionBackend):
                     window_kv_total_cpu=window_total_cpu,
                 )
             )
-            window_num_kv_splits = torch.empty(
-                (n_decode,), dtype=torch.int32, device=self.device
-            )
+            window_num_kv_splits = buffers.window_num_kv_splits[:n_decode]
             self.get_num_kv_splits(
                 window_num_kv_splits, window_kv_lens, is_window=True
             )
 
-        attn_logits = torch.empty(
-            (n_decode, self.num_head, self.max_kv_splits, self.v_head_dim),
-            dtype=torch.float32,
-            device=self.device,
-        )
+        attn_logits = buffers.attn_logits[:n_decode]
         swa_attn_logits = None
-        if self.swa_v_head_dim is not None:
-            swa_attn_logits = torch.empty(
-                (n_decode, self.num_head, self.max_kv_splits, self.swa_v_head_dim),
-                dtype=torch.float32,
-                device=self.device,
-            )
-        attn_lse = torch.empty(
-            (n_decode, self.num_head, self.max_kv_splits),
-            dtype=torch.float32,
-            device=self.device,
-        )
-        num_kv_splits = torch.empty(
-            (n_decode,), dtype=torch.int32, device=self.device
-        )
+        if buffers.swa_attn_logits is not None:
+            swa_attn_logits = buffers.swa_attn_logits[:n_decode]
+        attn_lse = buffers.attn_lse[:n_decode]
+        num_kv_splits = buffers.num_kv_splits[:n_decode]
         self.get_num_kv_splits(num_kv_splits, seq_lens)
 
         return ForwardMetadata(
