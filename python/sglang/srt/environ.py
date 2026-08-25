@@ -933,6 +933,22 @@ class Envs:
     # extend_attention_fwd for unsupported cases or when set false (e.g. for
     # debugging). Correctness is unaffected; this only changes performance.
     SGLANG_ENABLE_SPLITKV_VERIFY = EnvBool(True)
+    # Hard cap on the torch caching allocator's total RESERVED device memory,
+    # as a fraction of the device (torch.cuda.set_per_process_memory_fraction;
+    # see model_executor/allocator_guard.py for the full rationale). Keeps
+    # (1 - cap) of VRAM permanently available to non-torch runtime allocations
+    # (ROCm lazy per-queue kernel scratch, RCCL), which otherwise die with an
+    # uncatchable HSA_STATUS_ERROR_OUT_OF_RESOURCES abort when torch's cache
+    # parks at the wall (ROCm/clr#281; 2026-08-25 mixed-chunk incident). Also
+    # arms PYTORCH_ALLOC_CONF=garbage_collection_threshold, which is inert
+    # without a fraction cap. None (default) = uncapped, current behavior.
+    SGLANG_TORCH_MEM_FRACTION_CAP = EnvFloat(None)
+    # > 0: log torch allocator stats (allocated/reserved current+peak,
+    # num_alloc_retries, num_ooms, driver free) every N seconds from a daemon
+    # thread. The correct instruments for sizing mem-fraction-static; device
+    # "used" from rocm-smi saturates at torch's never-shrinking reserved
+    # high-water and cannot distinguish demand from cache.
+    SGLANG_TORCH_MEM_STATS_INTERVAL_S = EnvFloat(None)
     # Master switch for all async-asserted invariant probes (NaN, Inf, OOB,
     # page alignment). Off in prod; tests turn it on to fail-fast on
     # numerical / index violations instead of getting silent NaN cascades.
