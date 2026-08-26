@@ -1,4 +1,6 @@
 import logging
+import os
+import time
 from functools import partial
 from typing import Callable, Dict, List, Optional, Tuple
 
@@ -66,6 +68,132 @@ SGLANG_RETURN_ORIGINAL_LOGPROB = get_bool_env_var("SGLANG_RETURN_ORIGINAL_LOGPRO
 _CUSTOM_SAMPLER_FACTORIES: Dict[str, Callable[[], "Sampler"]] = {}
 _BUILT_IN_SAMPLING_BACKENDS = {"flashinfer", "pytorch", "ascend"}
 
+# Per-step sampler timing/allocation log every N calls (attribution tooling).
+_SAMPLER_DEBUG = get_bool_env_var("SGLANG_SAMPLER_DEBUG")
+_SAMPLER_DEBUG_INTERVAL = int(os.environ.get("SGLANG_SAMPLER_DEBUG_INTERVAL", "50"))
+# Sort-free top-p sampling for the pytorch backend (see _FastTopPSampler).
+_SAMPLER_FAST_TOPP = get_bool_env_var("SGLANG_SAMPLER_FAST_TOPP")
+
+
+class _FastTopPSampler:
+    """Sort-free top-p (+min-p) sampling for the pytorch sampling backend.
+
+    The stock pytorch fallback sorts the full [bs, vocab] probs tensor every
+    step: at bs=256 x 262k vocab (gemma-4) that is ~3.6 GB of transient
+    allocations per call (fp32 sorted values + int64 indices + cumsum +
+    multinomial workspace). Inside the ~13 GB post-KV HBM headroom this forces
+    caching-allocator churn (hipMalloc/hipFree = device-wide syncs) under load.
+
+    This path finds the nucleus threshold by binary search (S(t) = sum of
+    probs >= t; the sup t with S(t) >= top_p), masks below it, and samples via
+    the exponential race argmax(p/q), q ~ Exp(1) — an exact multinomial draw,
+    no renormalization needed since per-row scaling cannot change the argmax.
+    Threshold semantics match the flashinfer renorm kernels (ties at the
+    boundary are all kept; the sort-based path keeps an arbitrary subset).
+    All [bs, vocab] intermediates live in persistent buffers: steady-state
+    device allocations per call are O(bs) scalars only.
+
+    Handles top-p and min-p (min-p is a row-max-relative threshold, folded
+    into the final mask). Callers must route top-k and seeded-deterministic
+    requests to the legacy sort path.
+    """
+
+    def __init__(self):
+        # 16 halvings resolve the threshold to row_max/65536; the kept set can
+        # only be slightly larger than the exact nucleus (never smaller).
+        self.iters = int(os.environ.get("SGLANG_SAMPLER_FAST_TOPP_ITERS", "16"))
+        self._probs_masked: Optional[torch.Tensor] = None
+        self._noise: Optional[torch.Tensor] = None
+        self._mask: Optional[torch.Tensor] = None
+
+    def _ensure_bufs(self, bs: int, vocab: int, device) -> None:
+        cur = self._probs_masked
+        if cur is not None and cur.shape[0] >= bs and cur.shape[1] == vocab:
+            return
+        cap = bs if cur is None or cur.shape[1] != vocab else max(bs, 2 * cur.shape[0])
+        self._probs_masked = torch.empty(
+            cap, vocab, dtype=torch.float32, device=device
+        )
+        self._noise = torch.empty(cap, vocab, dtype=torch.float32, device=device)
+        self._mask = torch.empty(cap, vocab, dtype=torch.bool, device=device)
+
+    def sample(
+        self,
+        probs: torch.Tensor,
+        top_ps: torch.Tensor,
+        min_ps: torch.Tensor,
+        need_min_p_sampling: bool,
+    ) -> torch.Tensor:
+        bs, vocab = probs.shape
+        self._ensure_bufs(bs, vocab, probs.device)
+        pm = self._probs_masked[:bs]
+        noise = self._noise[:bs]
+        mask = self._mask[:bs]
+
+        row_max = probs.max(dim=-1, keepdim=True).values
+        tp = top_ps.view(-1, 1)
+        # Invariant: S(lo) >= top_p, S(hi) < top_p. S(0) = 1 covers top_p = 1.0
+        # rows (threshold converges to 0 = unfiltered).
+        lo = torch.zeros_like(row_max)
+        hi = row_max + 1e-7
+        for _ in range(self.iters):
+            thr = (lo + hi) * 0.5
+            torch.ge(probs, thr, out=mask)
+            torch.mul(probs, mask, out=pm)
+            ok = pm.sum(dim=-1, keepdim=True) >= tp
+            lo = torch.where(ok, thr, lo)
+            hi = torch.where(ok, hi, thr)
+        thr = lo
+        if need_min_p_sampling:
+            # Same semantics as the sort path: threshold at row_max * min_p
+            # (probs_sort[:, 0] is the row max, unchanged by nucleus masking).
+            thr = torch.maximum(thr, row_max * min_ps.view(-1, 1))
+        torch.ge(probs, thr, out=mask)
+        torch.mul(probs, mask, out=pm)
+        # clamp guards against a 0 from exponential_ (p/0 = inf would always win).
+        noise.exponential_(1.0).clamp_min_(1e-20)
+        pm.div_(noise)
+        return pm.argmax(dim=-1).to(torch.int32)
+
+
+_fast_topp_sampler = _FastTopPSampler() if _SAMPLER_FAST_TOPP else None
+
+# Max per-batch top_k the topk-slice path accepts. torch.topk radix-select is
+# fast on ROCm for small k (1.4 ms / 1.8 MB at k=64 x [256, 262k]); large k
+# falls back to a full sort internally (measured at k=4096), which is the
+# path this exists to avoid.
+_FAST_TOPK_SLICE_MAX_K = int(os.environ.get("SGLANG_SAMPLER_FAST_TOPK_MAX_K", "128"))
+
+
+def top_k_top_p_min_p_sampling_topk_slice(
+    probs: torch.Tensor,
+    sampling_info: SamplingBatchInfo,
+    max_k: int,
+) -> torch.Tensor:
+    """Exact reimplementation of the pytorch fallback on a topk slice.
+
+    Valid when every row's top_k <= max_k: applying top-k first (as the
+    fallback does) confines all downstream work — the exclusive-cumsum top-p
+    mask, the row-max-relative min-p mask, and the multinomial draw — to the
+    top-max_k slice. Positions < k of the descending cumsum are unaffected by
+    beyond-k mass, and position 0 (the row max) is never zeroed, so results
+    are distributionally identical to the full-vocab sort path while touching
+    [bs, max_k] instead of [bs, vocab] (3.6 GB of transients per call at
+    bs=256 x 262k, measured — the allocator churn behind 100-450 ms
+    CPU-blocked steps under load).
+    """
+    pv, pi = torch.topk(probs, max_k, dim=-1)  # sorted descending
+    csum = torch.cumsum(pv, dim=-1)
+    pv[
+        torch.arange(max_k, device=pv.device).view(1, -1)
+        >= sampling_info.top_ks.view(-1, 1)
+    ] = 0.0
+    pv[(csum - pv) > sampling_info.top_ps.view(-1, 1)] = 0.0
+    if sampling_info.need_min_p_sampling:
+        pv[pv < pv[:, 0:1] * sampling_info.min_ps.view(-1, 1)] = 0.0
+    sampled = torch.multinomial(pv, num_samples=1)
+    return torch.gather(pi.to(torch.int32), dim=1, index=sampled).view(-1)
+
 
 class Sampler(nn.Module):
     def __init__(self):
@@ -84,6 +212,7 @@ class Sampler(nn.Module):
         self.use_ascend_backend = get_exec().kernel.sampling_backend == "ascend"
 
         self.output_logprob_processor = OutputLogprobProcessor()
+        self._dbg_calls = 0
 
     def _preprocess_logits(
         self, logits: torch.Tensor, sampling_info: SamplingBatchInfo
@@ -118,6 +247,20 @@ class Sampler(nn.Module):
                 to get the unique seed for each position.
         """
         logits = logits_output.next_token_logits
+
+        # Attribution instrumentation: separates CPU-blocking time inside the
+        # sampler (allocator stalls show here) from the sampler's own GPU time
+        # and the prior GPU backlog absorbed at the trailing sync.
+        dbg = False
+        if _SAMPLER_DEBUG:
+            self._dbg_calls += 1
+            dbg = self._dbg_calls % _SAMPLER_DEBUG_INTERVAL == 0
+        if dbg:
+            dbg_stats0 = torch.cuda.memory_stats()
+            dbg_ev0 = torch.cuda.Event(enable_timing=True)
+            dbg_ev1 = torch.cuda.Event(enable_timing=True)
+            dbg_ev0.record()
+            dbg_wall0 = time.perf_counter()
 
         # Preprocess logits (custom processors and NaN handling)
         logits = self._preprocess_logits(logits, sampling_info)
@@ -241,6 +384,27 @@ class Sampler(nn.Module):
 
         self._sync_token_ids_across_tp(batch_next_token_ids, sampling_info)
 
+        if dbg:
+            dbg_ev1.record()
+            dbg_wall_body = time.perf_counter() - dbg_wall0
+            torch.cuda.synchronize()
+            dbg_wall_total = time.perf_counter() - dbg_wall0
+            dbg_stats1 = torch.cuda.memory_stats()
+            alloc_key = "allocated_bytes.all.allocated"
+            logger.info(
+                "SAMPLER_DBG bs=%d wall_body_ms=%.1f wall_sync_ms=%.1f "
+                "gpu_ms=%.1f dev_alloc=+%d dev_free=+%d alloc_mb=%.0f",
+                logits.shape[0],
+                dbg_wall_body * 1e3,
+                (dbg_wall_total - dbg_wall_body) * 1e3,
+                dbg_ev0.elapsed_time(dbg_ev1),
+                dbg_stats1.get("num_device_alloc", 0)
+                - dbg_stats0.get("num_device_alloc", 0),
+                dbg_stats1.get("num_device_free", 0)
+                - dbg_stats0.get("num_device_free", 0),
+                (dbg_stats1.get(alloc_key, 0) - dbg_stats0.get(alloc_key, 0)) / 1e6,
+            )
+
         return batch_next_token_ids
 
     def _sample_from_probs(
@@ -281,6 +445,22 @@ class Sampler(nn.Module):
                         filter_apply_order="joint",
                     )
             elif backend == "pytorch":
+                if (
+                    _fast_topp_sampler is not None
+                    and sampling_info.sampling_seed is None
+                ):
+                    if not sampling_info.need_top_k_sampling:
+                        return _fast_topp_sampler.sample(
+                            probs,
+                            sampling_info.top_ps,
+                            sampling_info.min_ps,
+                            sampling_info.need_min_p_sampling,
+                        )
+                    max_k = sampling_info.max_top_k_cpu
+                    if 0 < max_k <= _FAST_TOPK_SLICE_MAX_K:
+                        return top_k_top_p_min_p_sampling_topk_slice(
+                            probs, sampling_info, max_k
+                        )
                 # A slower fallback implementation with torch native operations.
                 batch_next_token_ids = top_k_top_p_min_p_sampling_from_probs_torch(
                     probs,
