@@ -5,6 +5,7 @@ import os
 import threading
 import time
 import uuid
+from collections import deque
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from enum import Enum
@@ -389,6 +390,27 @@ class HiCacheFile(HiCacheStorage):
             os.makedirs(self.file_path)
             logger.info(f"Created HiCacheFile storage directory at {self.file_path}")
 
+        # Drop written pages from the page cache (POSIX_FADV_DONTNEED). L3 is
+        # write-once archive data; buffered writes otherwise accumulate page
+        # cache charged to the pod's memory cgroup until memory.current pins
+        # at memory.max, where every allocation pays direct reclaim that must
+        # scan past the huge unreclaimable pinned L2 mapping (2026-08-19
+        # 01:20Z incident: 30-60s output-pipeline freezes). DONTNEED on dirty
+        # pages starts ASYNC writeback (same flusher path, whole-file extents
+        # - no sync/small-write behavior change) and drops clean pages; a
+        # second pass over a lag ring drops pages that were still dirty on
+        # the first pass. Read caching is left alone (caching L3 hits helps).
+        self._drop_page_cache = (
+            os.environ.get("SGLANG_HICACHE_FILE_DROP_CACHE", "1") == "1"
+        )
+        self._fadvise_ring: deque = deque()
+        self._fadvise_ring_lock = threading.Lock()
+        # ~256 files x ~700KB = ~180MB lag; at ~110MB/s write rate the oldest
+        # entry is ~1.6s old - past async writeback, so its pages drop clean.
+        self._fadvise_ring_size = int(
+            os.environ.get("SGLANG_HICACHE_FILE_DROP_CACHE_LAG_FILES", "256")
+        )
+
         # Metadata cache positive lookup toggle & TTL
         enable_cache_raw = None
         if storage_config.extra_config:
@@ -524,8 +546,21 @@ class HiCacheFile(HiCacheStorage):
                 f"{tensor_path}.tmp."
                 f"{os.getpid()}.{threading.get_ident()}.{uuid.uuid4().hex}"
             )
-            value.contiguous().view(dtype=torch.uint8).numpy().tofile(tmp_path)
+            data = value.contiguous().view(dtype=torch.uint8).numpy()
+            if self._drop_page_cache:
+                fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+                try:
+                    os.write(fd, memoryview(data))
+                    # Pass 1: kick async writeback for this file's dirty pages
+                    # and drop any already-clean ones.
+                    os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+                finally:
+                    os.close(fd)
+            else:
+                data.tofile(tmp_path)
             os.replace(tmp_path, tensor_path)
+            if self._drop_page_cache:
+                self._fadvise_lagged_drop(tensor_path)
             self._evictor.commit(suffixed)
             if self.metadata_cache is not None:
                 self.metadata_cache.add(suffixed)
@@ -543,6 +578,31 @@ class HiCacheFile(HiCacheStorage):
             if self.metadata_cache is not None:
                 self.metadata_cache.remove(suffixed)
             return False
+
+    def _fadvise_lagged_drop(self, path: str) -> None:
+        """Pass 2 of the cache-drop: re-fadvise a file written ~ring-size ago.
+
+        By the time a file leaves the lag ring its async writeback (started by
+        pass 1) has completed, so DONTNEED now drops the remaining pages.
+        Best-effort: the file may have been evicted meanwhile.
+        """
+        with self._fadvise_ring_lock:
+            self._fadvise_ring.append(path)
+            old = (
+                self._fadvise_ring.popleft()
+                if len(self._fadvise_ring) > self._fadvise_ring_size
+                else None
+            )
+        if old is None:
+            return
+        try:
+            fd = os.open(old, os.O_RDONLY)
+            try:
+                os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+            finally:
+                os.close(fd)
+        except OSError:
+            pass
 
     def batch_set(
         self,
