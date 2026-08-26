@@ -190,10 +190,10 @@ def resolving_view(server_args: Any) -> ResolvingConfig:
     return ResolvingConfig(server_args)
 
 
-# Ordered post-process passes (the normalization stage). List order is the
-# end-state execution order and mirrors today's handler call sequence in
-# __post_init__; during the transition each pass is invoked from its legacy
-# slot via run_post_process_pass, so ordering is preserved byte-for-byte.
+# Registered post-process passes, in definition order. Each is invoked from its
+# own slot, so this is a registry the checks enumerate rather than an execution
+# order: `_hisparse_validation` runs from `check_server_args`, a later stage than
+# the rest, and sits here among the __post_init__ passes.
 POST_PROCESS_PASSES: List[Callable[..., dict]] = []
 
 
@@ -223,10 +223,12 @@ def run_post_process_pass(server_args: Any, fn: Callable[..., dict]) -> None:
 
     Evaluates the pass on the resolving state (a read-only view with the
     accumulated declarations overlaid from the stash) and appends its
-    declaration to the stash. During ``__post_init__`` the fields stay
-    untouched: the stash is what the config bags are projected from. A pass
-    invoked after resolution finished (a post-init slot) writes through
-    immediately, because there is no later projection to pick it up.
+    declaration to the stash, which is what the config bags are projected from.
+    The fields stay untouched.
+
+    A slot that runs after resolution -- ``check_server_args`` hosts one -- lands
+    in the same stash, which publish projects from later, so it needs no field
+    write either.
     """
     declared = fn(ResolvedView(server_args, overlay=_declaration_overlay(server_args)))
     if not isinstance(declared, dict):
@@ -246,8 +248,6 @@ def run_post_process_pass(server_args: Any, fn: Callable[..., dict]) -> None:
             stash = server_args._resolved_overrides = []
         stash.append(entry)
         validate_declarations(server_args, [entry])
-        if getattr(server_args, "_resolution_finished", False):
-            _apply_fields(server_args, declared)
 
 
 def _apply_fields(server_args: Any, fields: Dict[str, Any]) -> None:
@@ -2801,6 +2801,7 @@ def _moe_runner_fusion_disable(view: Any) -> dict:
     return {}
 
 
+@register_post_process
 def _a2a_fusion_adjustments(view: Any) -> dict:
     """A2A-backend-driven shared-experts fusion adjustments, declared at the
     legacy write slots in _handle_a2a_moe: Waterfill requires the
@@ -2976,6 +2977,7 @@ def validate_declarations(
             )
 
 
+@register_post_process
 def _hrm_text_attention_force(view: Any) -> dict:
     """HRM-Text's bidirectional prefix attention only works on the Triton
     backend. Invoked as the last attention declaration of the resolution
