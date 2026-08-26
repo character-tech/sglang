@@ -25,6 +25,7 @@ from sglang.kernels.ops.attention.prefill_attention import (
     context_attention_fwd,
 )
 from sglang.kernels.ops.attention.score_mod import unpack_aux_tensors
+from sglang.kernels.ops.attention.tuning_table import lookup as _tune_lookup
 from sglang.srt.utils import is_cuda, is_gfx95_supported, is_hip
 
 _is_cuda = is_cuda()
@@ -709,14 +710,33 @@ def extend_attention_fwd(
         v_extend.shape[-1],
     )
 
-    # Get block sizes and configuration
-    BLOCK_DMODEL, BLOCK_DPE, BLOCK_DV, BLOCK_M, BLOCK_N, num_warps = (
+    # Dimension partitioning (BLOCK_DMODEL/DPE/DV) stays hardware/head-dim
+    # derived; the tunable tile + launch knobs (BLOCK_M/N, num_warps,
+    # num_stages, ROCm extra args) come from the per-shape table with defaults
+    # that reproduce _get_block_sizes_for_extend_attention + the prior
+    # constants exactly.
+    BLOCK_DMODEL, BLOCK_DPE, BLOCK_DV, _dm, _dn, _dw = (
         _get_block_sizes_for_extend_attention(Lq, Lv)
     )
 
     sm_scale = sm_scale or 1.0 / (Lq**0.5)
     batch_size, head_num = qo_indptr.shape[0] - 1, q_extend.shape[1]
-    kv_group_num = q_extend.shape[1] // k_extend.shape[1]
+    kv_head_num = k_extend.shape[1]
+    kv_group_num = q_extend.shape[1] // kv_head_num
+
+    # Extend is keyed by per-LAUNCH shape (chunked-prefill budget), not batch
+    # size: total new tokens = q_extend rows, sequence count = qo_indptr-1,
+    # mean prefix = flattened prefix indices / nseq. All host-side (tensor
+    # shapes), no device sync.
+    ntok = q_extend.shape[0]
+    prefix_approx = kv_indices.shape[0] // max(batch_size, 1)
+    cfg = _tune_lookup(
+        "extend", Lq, kv_group_num, kv_head_num, batch_size, prefix_approx,
+        ntok=ntok, nseq=batch_size,
+    )
+    BLOCK_M = cfg.block_m
+    BLOCK_N = cfg.block_n
+    num_warps = cfg.num_warps
 
     USE_CUSTOM_MASK = custom_mask is not None
     # Skip custom mask for prefix part
@@ -728,11 +748,8 @@ def extend_attention_fwd(
     stride_lse_h = lse_extend.stride(1) if STORE_LSE else 0
 
     grid = (batch_size, head_num, triton.cdiv(max_len_extend, BLOCK_M))
-    num_stages = 1
-
-    extra_kargs = {}
-    if _is_hip:
-        extra_kargs = {"waves_per_eu": 1, "matrix_instr_nonkdim": 16, "kpack": 2}
+    num_stages = cfg.num_stages
+    extra_kargs = cfg.extra_kargs()
 
     k_slot_stride, k_head_stride, k_page_stride, k_tok_stride = _extract_kv_strides(
         k_buffer, page_size

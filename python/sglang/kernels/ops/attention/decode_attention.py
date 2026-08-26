@@ -26,6 +26,7 @@ import triton
 import triton.language as tl
 
 from sglang.kernels.ops.attention.score_mod import unpack_aux_tensors
+from sglang.kernels.ops.attention.tuning_table import lookup as _tune_lookup
 from sglang.srt.utils import is_hip
 
 _is_hip = is_hip()
@@ -627,13 +628,8 @@ def _decode_grouped_att_m_fwd(
     score_mod=None,
     aux_tensors=None,
 ):
-    BLOCK = 32
     Lk = k_buffer.shape[-1]
     Lv = v_buffer.shape[-1]
-
-    # [TODO] work around shmem limit on MI3xx
-    if _is_hip and Lk >= 576:
-        BLOCK = 16
 
     if Lk == 576:
         BLOCK_DMODEL = 512
@@ -652,7 +648,24 @@ def _decode_grouped_att_m_fwd(
     batch, head_num = q.shape[0], q.shape[1]
     kv_group_num = q.shape[1] // kv_head_num
 
-    BLOCK_H = 16
+    # Per-shape launch config (defaults reproduce the prior constants exactly:
+    # BLOCK_N 32 / BLOCK_H 16 / num_warps 4 / num_stages 1(HIP) / waves 1,
+    # nonkdim 16, kpack 2). ``ctx`` is approximated from the flattened index
+    # length to avoid a device sync in the hot path.
+    ctx_approx = kv_indices.shape[0] // max(batch, 1)
+    cfg = _tune_lookup(
+        "decode_stage1", Lk, kv_group_num, kv_head_num, batch, ctx_approx
+    )
+    BLOCK = cfg.block_n
+    BLOCK_H = cfg.block_h
+    # num_kv_splits_cap is intentionally NOT applied here: the split count is
+    # shared across stage1's grid, stage2's loop, the per-request
+    # num_kv_splits tensor, and the caller's logits allocation, so it can only
+    # be varied consistently at the point those are built (the backend, or the
+    # sweep driver, which sets max_kv_splits + num_kv_splits directly). The
+    # field is carried in LaunchConfig so a sweep can record the best split
+    # policy alongside the tile config; the runtime launch honors the split
+    # count it was handed.
     MAX_KV_SPLITS = max_kv_splits
     grid = (
         batch,
@@ -660,13 +673,8 @@ def _decode_grouped_att_m_fwd(
         MAX_KV_SPLITS,
     )
 
-    extra_kargs = {}
-    num_stages = 2
-    if _is_hip:
-        # https://rocm.docs.amd.com/en/docs-6.2.0/how-to/llm-fine-tuning-optimization/optimizing-triton-kernel.html
-        # https://github.com/triton-lang/triton/blob/main/third_party/amd/backend/compiler.py
-        extra_kargs = {"waves_per_eu": 1, "matrix_instr_nonkdim": 16, "kpack": 2}
-        num_stages = 1
+    num_stages = cfg.num_stages
+    extra_kargs = cfg.extra_kargs()
 
     k_slot_stride, k_head_stride, k_page_stride, k_tok_stride = _extract_kv_strides(
         k_buffer, page_size
@@ -712,7 +720,7 @@ def _decode_grouped_att_m_fwd(
         MIN_BLOCK_KV=_MIN_BLOCK_KV,
         logit_cap=logit_cap,
         xai_temperature_len=xai_temperature_len,
-        num_warps=4,
+        num_warps=cfg.num_warps,
         num_stages=num_stages,
         Lk=Lk,
         Lv=Lv,
@@ -820,16 +828,19 @@ def _decode_softmax_reducev_fwd(
 ):
     batch, head_num = q.shape[0], q.shape[1]
     Lv = v_buffer.shape[-1]
+    Lk = q.shape[-1]
     BLOCK_DV = triton.next_power_of_2(Lv)
 
     MAX_KV_SPLITS = max_kv_splits
     HAS_SINK = sinks is not None
 
-    extra_kargs = {}
-    if _is_hip:
-        # https://rocm.docs.amd.com/en/docs-6.2.0/how-to/llm-fine-tuning-optimization/optimizing-triton-kernel.html
-        # https://github.com/triton-lang/triton/blob/main/third_party/amd/backend/compiler.py
-        extra_kargs = {"waves_per_eu": 4, "matrix_instr_nonkdim": 16, "kpack": 2}
+    kv_head_num = v_buffer.shape[-2]
+    kv_group_num = head_num // kv_head_num
+    # Per-shape stage-2 config; defaults reproduce prior constants exactly
+    # (num_warps 4, num_stages 2, HIP waves 4 / nonkdim 16 / kpack 2). Stage 2
+    # is the split-reduction, so ctx does not shape its cost; pass 0 (short).
+    cfg = _tune_lookup("decode_stage2", Lk, kv_group_num, kv_head_num, batch, 0)
+    extra_kargs = cfg.extra_kargs()
 
     grid = (batch, head_num)
     _fwd_kernel_stage2[grid](
@@ -851,8 +862,8 @@ def _decode_softmax_reducev_fwd(
         Lv=Lv,
         HAS_SINK=HAS_SINK,
         USE_PDL=use_pdl,
-        num_warps=4,
-        num_stages=2,
+        num_warps=cfg.num_warps,
+        num_stages=cfg.num_stages,
         **({"launch_pdl": True} if use_pdl else {}),
         **extra_kargs,
     )
