@@ -2079,10 +2079,15 @@ class UnifiedRadixCache(BasePrefixCache):
             return
         used = size - pool.available_size()
         target_used = int(size * self._WATERMARK)
-        if used <= target_used:
+        # Hysteresis: drive_host_eviction rebuilds an O(host-leaves) heap per
+        # call (measured 2.8% of scheduler wall at hicache-size 80 with the
+        # pool pinned at the watermark, firing every step for a few thousand
+        # tokens). Fire only once a full step batch has accumulated so the
+        # rebuild amortizes; the backup barrier still always finds free pages
+        # (size * (1 - watermark) - step_tokens of slack).
+        if used - target_used < self._WATERMARK_STEP_TOKENS:
             return
-        need = min(used - target_used, self._WATERMARK_STEP_TOKENS)
-        self.evict_host(need, BASE_COMPONENT_TYPE)
+        self.evict_host(self._WATERMARK_STEP_TOKENS, BASE_COMPONENT_TYPE)
 
         if self.pp_size != 1:
             self.writing_check()
