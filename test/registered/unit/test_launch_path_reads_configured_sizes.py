@@ -50,7 +50,7 @@ def _live_shadowed() -> dict:
         "no live-shadowed parallel size found; the derivation is broken, not "
         "the tree"
     )
-    return {name: f"get_parallel().config.{name}" for name in sorted(shadowed)}
+    return {name: f"get_parallel().configured_{name}" for name in sorted(shadowed)}
 
 
 _LIVE_SHADOWED = _live_shadowed()
@@ -371,7 +371,7 @@ class TestLaunchPathsReadConfiguredSizes(CustomTestCase):
         for name in sorted(_LIVE_SHADOWED):
             with self.subTest(size=name):
                 target = f"{state}.{live_getter[name]}"
-                configured = getattr(get_parallel().config, name)
+                configured = getattr(get_parallel(), f"configured_{name}")
                 with patch(target, return_value=configured + 41):
                     self.assertEqual(
                         get_parallel().__getattribute__(name),
@@ -379,10 +379,10 @@ class TestLaunchPathsReadConfiguredSizes(CustomTestCase):
                         f"{name} no longer follows the live topology",
                     )
                     self.assertEqual(
-                        getattr(get_parallel().config, name),
+                        getattr(get_parallel(), f"configured_{name}"),
                         configured,
-                        f"get_parallel().config.{name} followed the live topology "
-                        "instead of the published configuration",
+                        f"get_parallel().configured_{name} followed the live "
+                        "topology instead of the published configuration",
                     )
         # A leaf with no live property reads bare: there is no live value it
         # could be confused with. Compared against the declaration the bag was

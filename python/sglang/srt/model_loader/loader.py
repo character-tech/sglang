@@ -1891,7 +1891,7 @@ class PreshardedModelLoader(DefaultModelLoader):
             "ep": _safe(lambda: parallel.moe_ep_size),
             "pp": _safe(lambda: parallel.pp_size),
             "moe_dense_tp_size": parallel.moe_dense_tp_size,
-            "moe_dp_size": get_parallel().config.moe_dp_size,
+            "moe_dp_size": get_parallel().configured_moe_dp_size,
             "enable_dp_lm_head": parallel.enable_dp_lm_head,
             "enable_fp32_lm_head": get_exec().features.enable_fp32_lm_head,
             "quantization": model_config.quantization,

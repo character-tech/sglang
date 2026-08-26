@@ -393,7 +393,7 @@ class DataParallelController:
             threads.append(thread)
             base_gpu_id += (
                 server_args.tp_size
-                * get_parallel().config.pp_size
+                * get_parallel().configured_pp_size
                 * server_args.gpu_id_step
             )
 
@@ -615,8 +615,12 @@ class DataParallelController:
 
         scheduler_pipe_readers = []
 
-        pp_size_per_node = max(get_parallel().config.pp_size // server_args.nnodes, 1)
-        nnodes_per_pp_rank = max(server_args.nnodes // get_parallel().config.pp_size, 1)
+        pp_size_per_node = max(
+            get_parallel().configured_pp_size // server_args.nnodes, 1
+        )
+        nnodes_per_pp_rank = max(
+            server_args.nnodes // get_parallel().configured_pp_size, 1
+        )
         pp_rank_range = range(
             pp_size_per_node * (server_args.node_rank // nnodes_per_pp_rank),
             pp_size_per_node * (server_args.node_rank // nnodes_per_pp_rank + 1),
@@ -647,7 +651,7 @@ class DataParallelController:
                         tp_rank,
                         server_args.tp_size,
                         get_parallel().dp_size,
-                        get_parallel().config.attn_cp_size,
+                        get_parallel().configured_attn_cp_size,
                     )
                     # compute zmq ports for this dp rank
                     rank_port_args = PortArgs.init_new(
@@ -685,20 +689,20 @@ class DataParallelController:
                 attn_tp_size = (
                     server_args.tp_size
                     // attn_dp_size
-                    // get_parallel().config.attn_cp_size
+                    // get_parallel().configured_attn_cp_size
                 )
                 attn_cp_rank = (
                     tp_rank // attn_tp_size
-                ) % get_parallel().config.attn_cp_size
+                ) % get_parallel().configured_attn_cp_size
                 moe_dp_rank = tp_rank // (
-                    server_args.tp_size // get_parallel().config.moe_dp_size
+                    server_args.tp_size // get_parallel().configured_moe_dp_size
                 )
                 moe_ep_rank = (
                     tp_rank
-                    % (server_args.tp_size // get_parallel().config.moe_dp_size)
+                    % (server_args.tp_size // get_parallel().configured_moe_dp_size)
                     // (
                         server_args.tp_size
-                        // get_parallel().config.moe_dp_size
+                        // get_parallel().configured_moe_dp_size
                         // get_parallel().ep_size
                     )
                 )

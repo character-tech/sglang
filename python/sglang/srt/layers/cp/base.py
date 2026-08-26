@@ -283,13 +283,13 @@ def get_cp_strategy() -> Optional[ContextParallelStrategy]:
 
     if _STRATEGY is None:
         try:
-            parallel = get_parallel().config
+            parallel = get_parallel()
         except ValueError:
             return None
         if parallel.enable_prefill_cp:
             init_cp_strategy(
                 enable_prefill_cp=True,
-                cp_size=parallel.attn_cp_size,
+                cp_size=parallel.configured_attn_cp_size,
                 cp_strategy=parallel.cp_strategy,
             )
     return _STRATEGY

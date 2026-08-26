@@ -21,8 +21,9 @@ this is a read-through wrapper, not a cache. It gives call-sites one import and
 one naming scheme in place of a dozen free functions, plus a test-only
 ``override()`` hook to force a topology without monkeypatching the underlying
 getters. The resolved parallel **configuration** is the same object's ``config``
-hop (``get_parallel().config.tp_size``), which reads the published ``parallel``
-bag: bare is the live group, ``config`` is what was configured.
+named accessor (``get_parallel().configured_tp_size``), which reads the
+published ``parallel`` bag: bare is the live group, ``configured_`` is the width
+the launch asked for.
 
 ``get_server_args()`` returns the process-wide ``ServerArgs``. This is the
 user's raw input, kept **read-only** for debug and reproduction; what
@@ -142,8 +143,9 @@ class ParallelContext:
     read-through ``@property`` over the canonical getters, so they answer with
     the **live** process groups and raise before distributed init. The resolved
     parallel **configuration** is one hop away, on the published bag:
-    ``get_parallel().config.tp_size``, ``.config.nccl_port``. It answers in any
-    process at any point after publish, and follows a post-publish ``override``.
+    ``get_parallel().configured_tp_size``; a leaf with no live counterpart is
+    read bare (``get_parallel().nccl_port``). Both answer in any process at any
+    point after publish, and follow a post-publish ``override``.
 
     The two disagree by design, so which one a call site wants is spelled at the
     call site — no ``config`` means live. Elastic EP scales the live world away
@@ -157,21 +159,6 @@ class ParallelContext:
     def __init__(self):
         self._overrides = {}
         self._config = None  # parallel config bag, wired at publish
-
-    @property
-    def config(self) -> _ConfigBag:
-        """The published ``parallel`` config bag.
-
-        Reads the slot directly: ``parallel`` sits outside the per-role
-        namespace table (every process reads topology config), so no role check
-        applies here. The body stays
-        dynamo-traceable — ``get_parallel().config.moe_dense_tp_size`` and the
-        gate helpers over it run inside compiled model forwards.
-        """
-        config = self._config
-        if config is None:
-            raise ValueError("config namespace 'parallel' not published")
-        return config
 
     def __getattr__(self, name):
         # Reached only for names that are neither a live @property nor a slot:
@@ -214,6 +201,37 @@ class ParallelContext:
     @property
     def world_rank(self) -> int:
         return self._v("world_rank", _ps().get_world_rank)
+
+    # A size that also names a live group needs both answers: the group this
+    # process ended up in, and the width the launch asked for. They are equal
+    # once the groups exist and are built from the configuration -- but the
+    # launch paths run before that, and `patch_tensor_parallel_group` gives a
+    # draft worker a narrower TP group than the target's on purpose.
+    @property
+    def configured_tp_size(self) -> int:
+        return self._configured("tp_size")
+
+    @property
+    def configured_pp_size(self) -> int:
+        return self._configured("pp_size")
+
+    @property
+    def configured_attn_cp_size(self) -> int:
+        return self._configured("attn_cp_size")
+
+    @property
+    def configured_dcp_size(self) -> int:
+        return self._configured("dcp_size")
+
+    @property
+    def configured_moe_dp_size(self) -> int:
+        return self._configured("moe_dp_size")
+
+    def _configured(self, name):
+        config = self._config
+        if config is None:
+            raise ValueError("config namespace 'parallel' not published")
+        return getattr(config, name)
 
     @property
     def tp_size(self) -> int:
@@ -1611,7 +1629,7 @@ def max_prefill_buffer_tokens() -> int:
     tokens = chunked
     if (
         schedule.enable_dynamic_chunking
-        and get_parallel().config.pp_size > 1
+        and get_parallel().configured_pp_size > 1
         and chunked
     ):
         tokens = max(
@@ -1643,9 +1661,11 @@ def pre_capture_activation_reserve_mb(gpu_mem: float | None) -> float:
         activation_tokens = max(schedule.chunked_prefill_size, 2048)
     else:
         activation_tokens = max(schedule.max_prefill_tokens, 2048)
-    parallel = get_parallel().config
+    parallel = get_parallel()
     reserved_mem = (
-        512 + activation_tokens * 1.5 + parallel.tp_size * parallel.pp_size / 8 * 1024
+        512
+        + activation_tokens * 1.5
+        + parallel.configured_tp_size * parallel.configured_pp_size / 8 * 1024
     )
     if gpu_mem is not None and gpu_mem > 60 * 1024:
         reserved_mem = max(reserved_mem, 10 * 1024)

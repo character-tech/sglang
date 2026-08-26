@@ -620,11 +620,11 @@ def _live_shadowed_sizes() -> frozenset:
 
 
 def _parallel_config_reads(tree, subjects):
-    """Names in ``subjects`` read through the parallel bag's ``config`` hop.
+    """Names in ``subjects`` read through their ``configured_`` accessor.
 
-    Sees ``get_parallel().config.pp_size``, the module-qualified spelling, a
-    local bound to either hop (``p = get_parallel()`` / ``cfg = p.config``), and
-    the ``getattr`` form of each.
+    Sees ``get_parallel().configured_pp_size``, the module-qualified spelling, a
+    local bound to the context (``p = get_parallel()``), and the ``getattr``
+    form of each.
     """
     fns, modules = set(), set()
     for node in ast.walk(tree):
@@ -667,70 +667,51 @@ def _parallel_config_reads(tree, subjects):
             and dotted(func.value) in modules
         )
 
-    bag_aliases, config_aliases = set(), set()
-    for _ in range(2):  # a local copy of a local is still the same object
-        for node in ast.walk(tree):
-            if not isinstance(node, ast.Assign):
-                continue
-            value = node.value
-            if is_bag_call(value) or (
-                isinstance(value, ast.Name) and value.id in bag_aliases
-            ):
-                bucket = bag_aliases
-            elif (
-                isinstance(value, ast.Attribute)
-                and value.attr == "config"
-                and (
-                    is_bag_call(value.value)
-                    or (
-                        isinstance(value.value, ast.Name)
-                        and value.value.id in bag_aliases
-                    )
-                )
-            ) or (isinstance(value, ast.Name) and value.id in config_aliases):
-                bucket = config_aliases
-            else:
-                continue
-            bucket |= {t.id for t in node.targets if isinstance(t, ast.Name)}
+    bag_aliases = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Assign) or len(node.targets) != 1:
+            continue
+        target, value = node.targets[0], node.value
+        if not isinstance(target, ast.Name):
+            continue
+        if is_bag_call(value) or (
+            isinstance(value, ast.Name) and value.id in bag_aliases
+        ):
+            bag_aliases.add(target.id)
 
-    def is_config_hop(node):
-        return (
-            isinstance(node, ast.Attribute)
-            and node.attr == "config"
-            and (
-                is_bag_call(node.value)
-                or (isinstance(node.value, ast.Name) and node.value.id in bag_aliases)
-            )
-        ) or (isinstance(node, ast.Name) and node.id in config_aliases)
+    def is_bag(node):
+        return is_bag_call(node) or (
+            isinstance(node, ast.Name) and node.id in bag_aliases
+        )
 
+    named = {f"configured_{name}": name for name in subjects}
     found = set()
     for node in ast.walk(tree):
-        if isinstance(node, ast.Attribute) and node.attr in subjects:
-            base, name = node.value, node.attr
+        if isinstance(node, ast.Attribute) and node.attr in named:
+            base, name = node.value, named[node.attr]
         elif (
             isinstance(node, ast.Call)
             and isinstance(node.func, ast.Name)
             and node.func.id == "getattr"
             and len(node.args) >= 2
             and isinstance(node.args[1], ast.Constant)
-            and node.args[1].value in subjects
+            and node.args[1].value in named
         ):
-            base, name = node.args[0], node.args[1].value
+            base, name = node.args[0], named[node.args[1].value]
         else:
             continue
-        if is_config_hop(base):
+        if is_bag(base):
             found.add(name)
     return found
 
 
 _READ_SPELLINGS = (
-    "from sglang.srt.runtime_context import get_parallel\nx = get_parallel().config.tp_size",
-    "from sglang.srt.runtime_context import get_parallel as gp\nx = gp().config.tp_size",
-    "from sglang.srt import runtime_context as rc\nx = rc.get_parallel().config.tp_size",
-    "import sglang.srt.runtime_context\nx = sglang.srt.runtime_context.get_parallel().config.tp_size",
-    "from sglang.srt.runtime_context import get_parallel\np = get_parallel()\nx = p.config.tp_size",
-    "from sglang.srt.runtime_context import get_parallel\nc = get_parallel().config\nx = c.tp_size",
-    'from sglang.srt.runtime_context import get_parallel\nx = getattr(get_parallel().config, "tp_size")',
+    "from sglang.srt.runtime_context import get_parallel\nx = get_parallel().configured_tp_size",
+    "from sglang.srt.runtime_context import get_parallel as gp\nx = gp().configured_tp_size",
+    "from sglang.srt import runtime_context as rc\nx = rc.get_parallel().configured_tp_size",
+    "import sglang.srt.runtime_context\nx = sglang.srt.runtime_context.get_parallel().configured_tp_size",
+    "from sglang.srt.runtime_context import get_parallel\np = get_parallel()\nx = p.configured_tp_size",
+    'from sglang.srt.runtime_context import get_parallel\nx = getattr(get_parallel(), "configured_tp_size")',
 )
 
 
