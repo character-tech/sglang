@@ -154,6 +154,10 @@ class WeightChecker:
             ),
             allow_quant_error=allow_quant_error,
         )
+        # The snapshot is a host copy of every weight (tens of GB for a large
+        # model), only ever consumed here. Release it once the check passes;
+        # a failed compare keeps it around for debugging.
+        self._snapshot_tensors = None
 
     def _compute_checksum(self, skip_tensor_list: Optional[List[str]] = None) -> Dict:
         torch.cuda.synchronize()
