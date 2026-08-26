@@ -408,6 +408,7 @@ class TritonAttnBackend(AttentionBackend):
         bs: int,
         seq_lens: torch.Tensor,
         req_pool_indices: torch.Tensor,
+        seq_lens_cpu: Optional[torch.Tensor] = None,
     ):
         """Fill KV (and SWA) cuda-graph buffers for decode/idle mode.
 
@@ -444,6 +445,11 @@ class TritonAttnBackend(AttentionBackend):
         if self.sliding_window_size is not None and self.sliding_window_size > 0:
             # Unified pool: leave the window VIRTUAL too (translated alongside the
             # full kv_indices later); baseline SWA keeps the eager window translate.
+            window_total_cpu = None
+            if seq_lens_cpu is not None:
+                window_total_cpu = int(
+                    seq_lens_cpu[:bs].clamp(max=self.sliding_window_size).sum()
+                )
             window_kv_indptr, _, window_kv_lens, _ = update_sliding_window_buffer(
                 self.window_kv_indptr,
                 self.req_to_token,
@@ -454,6 +460,7 @@ class TritonAttnBackend(AttentionBackend):
                 token_to_kv_pool=self.token_to_kv_pool,
                 window_kv_indices=self.cuda_graph_window_kv_indices,
                 skip_full_to_swa_translation=(self._translate_kv_loc is not None),
+                window_kv_total_cpu=window_total_cpu,
             )
         return kv_indptr, window_kv_indptr, window_kv_lens, num_kv_splits_lens
 
@@ -609,6 +616,7 @@ class TritonAttnBackend(AttentionBackend):
                 seq_lens=seq_lens,
                 forward_mode=forward_mode,
                 spec_info=spec_info,
+                seq_lens_cpu=forward_batch.seq_lens_cpu,
             )
             out_cache_loc_full_physical = self._translate_cuda_graph_shared_pool_locs(
                 forward_batch, bs
@@ -628,6 +636,7 @@ class TritonAttnBackend(AttentionBackend):
                 seq_lens=seq_lens,
                 forward_mode=forward_mode,
                 spec_info=spec_info,
+                seq_lens_cpu=forward_batch.seq_lens_cpu,
             )
             # Metadata view is reused from capture; just refill the buffers.
             self._translate_cuda_graph_shared_pool_locs(forward_batch, bs)
@@ -893,6 +902,12 @@ class TritonAttnBackend(AttentionBackend):
                 if self._translate_kv_loc is not None:
                     kv_indices = self._translate_kv_loc(kv_indices)
             if self.sliding_window_size is not None and self.sliding_window_size > 0:
+                window_total_cpu = None
+                if forward_batch.extend_prefix_lens_cpu is not None:
+                    window_total_cpu = sum(
+                        min(int(x), self.sliding_window_size)
+                        for x in forward_batch.extend_prefix_lens_cpu
+                    )
                 (
                     window_kv_indptr,
                     window_kv_indices,
@@ -907,6 +922,7 @@ class TritonAttnBackend(AttentionBackend):
                     bs,
                     self.device,
                     self.token_to_kv_pool,
+                    window_kv_total_cpu=window_total_cpu,
                 )
 
             qo_indptr = self.qo_indptr
@@ -1170,6 +1186,7 @@ class TritonAttnBackend(AttentionBackend):
         seq_lens: torch.Tensor,
         forward_mode: ForwardMode,
         spec_info: Optional[SpecInput],
+        seq_lens_cpu: Optional[torch.Tensor] = None,
     ):
         """Shared capture+replay body for the cuda-graph init path.
 
@@ -1179,7 +1196,7 @@ class TritonAttnBackend(AttentionBackend):
         if forward_mode.is_decode_or_idle():
             assert spec_info is None, "Multi-step cuda graph init is not done here."
             _, _, window_kv_lens, num_kv_splits_lens = self._update_decode_kv_buffers(
-                bs, seq_lens, req_pool_indices
+                bs, seq_lens, req_pool_indices, seq_lens_cpu=seq_lens_cpu
             )
             self.get_num_kv_splits(
                 self.cuda_graph_num_kv_splits[:bs], num_kv_splits_lens[:bs]
@@ -2062,6 +2079,7 @@ def update_sliding_window_buffer(
     token_to_kv_pool=None,
     window_kv_indices=None,
     skip_full_to_swa_translation=False,
+    window_kv_total_cpu=None,
 ):
     """Fill window KV buffers for sliding-window attention.
 
@@ -2083,9 +2101,21 @@ def update_sliding_window_buffer(
     )
     window_kv_indptr[1 : bs + 1] = torch.cumsum(window_kv_lens, dim=0)
     window_kv_indptr = window_kv_indptr[: bs + 1]
+    # window_kv_indptr[-1] is a GPU scalar: reading it (as an alloc size or a
+    # slice bound) forces a device-wide sync that serializes metadata prep for
+    # step N+1 behind step N's kernels — the overlap schedule collapses and
+    # every ms of scheduler python lands 1:1 on TPOT. Callers that know the
+    # total from CPU-side seq lens pass window_kv_total_cpu to keep this
+    # function sync-free.
     if window_kv_indices is None:
         window_kv_indices = torch.empty(
-            window_kv_indptr[-1], dtype=torch.int64, device=device
+            (
+                window_kv_total_cpu
+                if window_kv_total_cpu is not None
+                else window_kv_indptr[-1]
+            ),
+            dtype=torch.int64,
+            device=device,
         )
     window_kv_start_idx = seq_lens - window_kv_lens
     create_flashinfer_kv_indices_triton[(bs,)](
@@ -2100,7 +2130,11 @@ def update_sliding_window_buffer(
     if not skip_full_to_swa_translation and hasattr(
         token_to_kv_pool, "translate_loc_from_full_to_swa"
     ):
-        kv_last_index = window_kv_indptr[-1]
+        kv_last_index = (
+            window_kv_total_cpu
+            if window_kv_total_cpu is not None
+            else window_kv_indptr[-1]
+        )
         window_kv_indices[:kv_last_index] = (
             token_to_kv_pool.translate_loc_from_full_to_swa(
                 window_kv_indices[:kv_last_index]
