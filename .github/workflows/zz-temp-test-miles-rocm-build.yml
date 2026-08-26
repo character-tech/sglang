@@ -1,0 +1,60 @@
+name: '[TEMP] Test Miles ROCm Image Build (AMD)'
+
+# Throwaway harness: build-only rehearsal of the miles ROCm nightly release images
+# against a candidate miles ref. No Docker Hub login and no push, so it never
+# publishes a tag. Delete this file and its branch once the candidate ref merges.
+
+on:
+  workflow_dispatch:
+    inputs:
+      miles_repository:
+        description: 'Miles repository to build from'
+        required: true
+        default: 'michaelzhang-ai/miles'
+        type: string
+      miles_ref:
+        description: 'Miles ref to build from'
+        required: true
+        default: 'cursor/drop-obsolete-rocm-megatron-patch-e35f'
+        type: string
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    if: github.repository == 'sgl-project/sglang'
+    runs-on: amd-docker-scale
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        variant:
+          - rocm700-mi35x
+          - rocm700-mi30x
+          - rocm720-mi35x
+    steps:
+      - name: Checkout miles repository
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.miles_repository }}
+          ref: ${{ inputs.miles_ref }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Record miles commit
+        run: echo "Building from ${{ inputs.miles_repository }}@${{ inputs.miles_ref }} @ $(git rev-parse HEAD)"
+
+      - name: Install docker/build.py dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3-pip
+          python3 -m pip install --break-system-packages --quiet typer
+
+      - name: Build image via miles docker/build.py
+        run: python3 docker/build.py --variant ${{ matrix.variant }} --image-tag custom --custom-tag miles-buildtest
+
+      - name: Report built image
+        run: docker image inspect rocm/sgl-dev:miles-buildtest-${{ matrix.variant }} --format 'built {{.RepoTags}} size={{.Size}}'
