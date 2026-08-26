@@ -72,6 +72,7 @@ from sglang.srt.observability.metrics_collector import (
 from sglang.srt.session.streaming_session import StreamingSession
 
 if TYPE_CHECKING:
+    from sglang.srt.managers.cache_controller import HiCacheAck
     from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.mem_cache.cache_init_params import CacheInitParams
     from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
@@ -81,6 +82,14 @@ if TYPE_CHECKING:
 
 
 T = TypeVar("T")
+
+# Metric label per component, matching the host pool names used by
+# hicache_backup_tokens_total and the host occupancy gauges.
+_COMPONENT_POOL_LABEL = {
+    ComponentType.FULL: PoolName.KV.value,
+    ComponentType.SWA: PoolName.SWA.value,
+    ComponentType.MAMBA: PoolName.MAMBA.value,
+}
 
 
 COMPONENT_REGISTRY: dict[ComponentType, type[TreeComponent]] = {
@@ -213,7 +222,10 @@ class UnifiedRadixCache(BasePrefixCache):
         self.hicache_storage_pass_prefix_keys = False
 
         self.reset()
-        logger.info(f"Init Unified RadixTree with components {self.tree_components}")
+        logger.info(
+            f"Init Unified Radix Cache. Components: {self.tree_components}. "
+            f"Tree Core: {type(self.tree_core).__name__}"
+        )
 
     def _all_reduce_attn_groups(self, tensor: torch.Tensor, op):
         reduced = False
@@ -357,6 +369,14 @@ class UnifiedRadixCache(BasePrefixCache):
             self.cache_controller is not None
             and self.cache_controller.write_policy == "write_back"
         )
+        # Pre-seed the dropped-tokens series at 0 per pool
+        if self.metrics_collector is not None and self.cache_controller is not None:
+            for ct in self.tree_components:
+                self.metrics_collector.increment_dropped_tokens(
+                    num_tokens=0,
+                    reason="host_pressure",
+                    pool=_COMPONENT_POOL_LABEL[ct],
+                )
         self.load_back_threshold = 10
         self.prefetch_stop_policy = server_args.hicache_storage_prefetch_policy
 
@@ -433,7 +453,8 @@ class UnifiedRadixCache(BasePrefixCache):
         ):
             self.writing_check(write_back=True)
 
-        self.update_eviction_metrics(sum(tracker.values()), start_time)
+        # Report full-layer tokens only
+        self.update_eviction_metrics(tracker[BASE_COMPONENT_TYPE], start_time)
         return EvictResult(
             num_tokens_evicted=tracker[BASE_COMPONENT_TYPE],
             swa_num_tokens_evicted=tracker.get(ComponentType.SWA, 0),
@@ -516,10 +537,12 @@ class UnifiedRadixCache(BasePrefixCache):
                         written = self._execute_and_commit_kv_backup(
                             backup_kv, write_back=True
                         )
+                        freed_before_drop = dict(tracker)
                         if written > 0:
                             self.writing_check(write_back=True)
                             self._demote(node_id, tracker)
                         elif self._drop_subtree_no_host(node_id, tracker):
+                            self._record_dropped_tokens(tracker, freed_before_drop)
                             logger.warning(
                                 "write_back: KV subtree dropped without backup "
                                 "due to host memory pressure, root node %d",
@@ -535,6 +558,23 @@ class UnifiedRadixCache(BasePrefixCache):
                             )
             finally:
                 self.tree_core.evict_device_end(ct)
+
+    def _record_dropped_tokens(
+        self,
+        tracker: dict[ComponentType, int],
+        freed_before_drop: dict[ComponentType, int],
+    ) -> None:
+        """Record per-pool tokens dropped without backup under host pressure."""
+        if self.metrics_collector is None:
+            return
+        for ct, freed in tracker.items():
+            dropped = freed - freed_before_drop[ct]
+            if dropped > 0:
+                self.metrics_collector.increment_dropped_tokens(
+                    num_tokens=dropped,
+                    reason="host_pressure",
+                    pool=_COMPONENT_POOL_LABEL[ct],
+                )
 
     def inc_lock_ref(
         self, node_id: NodeId, skip_lock_components: Sequence[ComponentType] = ()
@@ -696,7 +736,7 @@ class UnifiedRadixCache(BasePrefixCache):
             kv_indices = self.req_to_token_pool.req_to_token[
                 req.req_pool_idx, : len(token_ids)
             ]
-            req.prefix_indices = kv_indices
+            req.prefix_indices = kv_indices.to(dtype=torch.int64, copy=True)
             return
 
         kv_indices_orig = self.req_to_token_pool.req_to_token[
@@ -720,11 +760,20 @@ class UnifiedRadixCache(BasePrefixCache):
             if cl is not None:
                 effective_cache_len = min(effective_cache_len, cl)
 
+        radix_key = RadixKey(
+            token_ids[:effective_cache_len],
+            req.extra_key,
+            is_bigram=self.tree_core.is_eagle,
+        )
+
         if envs.SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS.get():
+            # The frontier lands a page below page_floor(pre_len + 1), which has to
+            # be where the insert stops, or the leaf it creates keeps less than a
+            # sliding window of live SWA and the match after the insert rejects it.
+            # The insert stops at page_floor(len(radix_key)), and a bigram key is
+            # one shorter than the tokens it spans, so measure the key.
             for comp in self._components_tuple:
-                comp.free_out_of_window_slots(
-                    req, effective_cache_len - 1, insert_params
-                )
+                comp.free_out_of_window_slots(req, len(radix_key) - 1, insert_params)
 
         if effective_cache_len <= 0:
             req.prefix_indices = kv_indices_orig.to(dtype=torch.int64, copy=True)
@@ -736,11 +785,7 @@ class UnifiedRadixCache(BasePrefixCache):
 
         kv_indices = kv_indices_orig[:effective_cache_len]
 
-        radix_key = RadixKey(
-            token_ids[:effective_cache_len],
-            req.extra_key,
-            is_bigram=self.tree_core.is_eagle,
-        ).page_aligned(self.page_size)
+        radix_key = radix_key.page_aligned(self.page_size)
         page_aligned_len = len(radix_key)
         values = kv_indices[:page_aligned_len].to(dtype=torch.int64, copy=True)
 
@@ -1794,22 +1839,30 @@ class UnifiedRadixCache(BasePrefixCache):
                 else ()
             )
 
+        # Piggybacked TP check: [digest, -digest] MIN-reduces to [min, -max],
+        # equal iff reclaim victim order matched on every rank.
+        digest = self.tree_core.write_back_duplicate_reclaim_digest
         ready_counts = torch.tensor(
             [
                 write_acks,
                 load_acks,
                 *storage_queue_sizes,
+                digest,
+                -digest,
             ],
-            dtype=torch.int,
+            dtype=torch.int64,
             device="cpu",
         )
         self._all_reduce(ready_counts, torch.distributed.ReduceOp.MIN)
 
         count_values = list(map(int, ready_counts.tolist()))
+        assert (
+            count_values[-2] == -count_values[-1]
+        ), "write_back duplicate-reclaim victims diverged across TP ranks"
         return (
             count_values[0],
             count_values[1],
-            tuple(count_values[2:]),
+            tuple(count_values[2:-2]),
             extra_pool_names,
         )
 
@@ -1829,6 +1882,7 @@ class UnifiedRadixCache(BasePrefixCache):
                     for ack_id in ack.node_ids:
                         if ack_id in self.ongoing_write_through:
                             self._finish_write_through_ack(ack_id)
+                    self._log_write_ack_metrics(ack)
                 cc.ack_write_queue.clear()
                 assert len(self.ongoing_write_through) == 0
             return
@@ -1851,7 +1905,23 @@ class UnifiedRadixCache(BasePrefixCache):
             ack.finish_event.synchronize()
             for ack_id in ack.node_ids:
                 self._finish_write_through_ack(ack_id)
+            self._log_write_ack_metrics(ack)
             finish_count -= 1
+
+    def _log_write_ack_metrics(self, ack: HiCacheAck) -> None:
+        """Record D->H backup volume and duration for a completed write ack."""
+        if self.metrics_collector is None:
+            return
+        for pool, num_tokens in (ack.num_tokens_by_pool or {}).items():
+            if num_tokens > 0:
+                self.metrics_collector.increment_backup_num_tokens(
+                    num_tokens=num_tokens, pool=pool
+                )
+        if ack.num_bytes > 0:
+            self.metrics_collector.increment_backup_num_bytes(ack.num_bytes)
+        if ack.timing_enabled:
+            duration_ms = ack.start_event.elapsed_time(ack.finish_event)
+            self.metrics_collector.observe_backup_duration(duration_ms / 1000.0)
 
     def loading_check(self, finish_count: Optional[int] = None) -> None:
         """Poll load-back completions."""
@@ -1864,11 +1934,17 @@ class UnifiedRadixCache(BasePrefixCache):
             finish_count = 0
             if self.pp_rank == 0:
                 finish_count = self._count_ready_acks(cc.ack_load_queue)
-            finish_count_tensor = torch.tensor(
-                finish_count, dtype=torch.int, device="cpu"
+            # Piggybacked TP check: [digest, -digest] MIN-reduces to [min, -max],
+            # equal iff reclaim victim order matched on every rank.
+            digest = self.tree_core.write_back_duplicate_reclaim_digest
+            sync_tensor = torch.tensor(
+                [finish_count, digest, -digest], dtype=torch.int64, device="cpu"
             )
-            self._all_reduce(finish_count_tensor, torch.distributed.ReduceOp.MIN)
-            finish_count = finish_count_tensor.item()
+            self._all_reduce(sync_tensor, torch.distributed.ReduceOp.MIN)
+            finish_count = int(sync_tensor[0].item())
+            assert (
+                sync_tensor[1].item() == -sync_tensor[2].item()
+            ), "write_back duplicate-reclaim victims diverged across TP ranks"
 
         while finish_count > 0:
             ack = cc.ack_load_queue.pop(0)
@@ -1877,9 +1953,17 @@ class UnifiedRadixCache(BasePrefixCache):
                 node, lock_params, host_lock_params = self.ongoing_load_back.pop(ack_id)
                 self.dec_lock_ref(node, lock_params)
                 self.dec_host_lock_ref(node, host_lock_params)
+                # Unpin the loaded nodes; host copies stay as reclaimable duplicates.
+                self.tree_core.finish_load_back(node)
 
             if self.metrics_collector is not None:
-                self.metrics_collector.increment_load_back_num_tokens(ack.num_tokens)
+                for pool, num_tokens in (ack.num_tokens_by_pool or {}).items():
+                    if num_tokens > 0:
+                        self.metrics_collector.increment_load_back_num_tokens(
+                            num_tokens=num_tokens, pool=pool
+                        )
+                if ack.num_bytes > 0:
+                    self.metrics_collector.increment_load_back_num_bytes(ack.num_bytes)
                 if ack.timing_enabled:
                     duration_ms = ack.start_event.elapsed_time(ack.finish_event)
                     self.metrics_collector.observe_load_back_duration(
@@ -2003,6 +2087,14 @@ class UnifiedRadixCache(BasePrefixCache):
             and not self.tree_core.has_swa_host_pool
         )
         return swa.sliding_window_size if unified_compress_only_hicache else 0
+
+    def swa_retain_floor(self, req) -> int | None:
+        if not self.is_mamba_enabled or self._sliding_window_size is None:
+            return None
+        checkpoint = req.mamba_last_track_seqlen
+        if checkpoint is None:
+            return None
+        return checkpoint - self._sliding_window_size
 
     def supports_swa(self) -> bool:
         return self.is_swa_enabled
@@ -2191,4 +2283,4 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def root_node_handle(self, extra_key: Optional[str] = None) -> NodeId:
         """The root's NodeId -- URC match results carry NodeIds."""
-        return self.tree_core.root_node.id
+        return self.tree_core.root_node_handle(extra_key)
