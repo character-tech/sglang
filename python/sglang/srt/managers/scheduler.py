@@ -585,7 +585,6 @@ class Scheduler(
                     else self.tp_cpu_group
                 ),
                 tree_cache=self.tree_cache,
-                server_args=self.server_args,
             )
         else:
             self.decode_offload_manager = None
@@ -3592,9 +3591,7 @@ class Scheduler(
                 if mamba_allocator is not None
                 else None
             )
-            retracted_reqs, new_token_ratio, reqs_to_abort = batch.retract_decode(
-                self.server_args
-            )
+            retracted_reqs, new_token_ratio, reqs_to_abort = batch.retract_decode()
             new_available_tokens = self.token_to_kv_pool_allocator.available_size()
             new_token_gained = new_available_tokens - old_available_tokens
             mamba_num_gained = (
@@ -4816,7 +4813,6 @@ class Scheduler(
             # discarded. Non-decode modes ignore offload_kv (they never offload).
             retract_all(
                 reqs=retract_reqs,
-                server_args=self.server_args,
                 req_to_token_pool=self.req_to_token_pool,
                 token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
                 tree_cache=self.tree_cache,
