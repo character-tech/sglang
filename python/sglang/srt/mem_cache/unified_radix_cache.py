@@ -2063,32 +2063,14 @@ class UnifiedRadixCache(BasePrefixCache):
         # DMA/lock safety invariants; only the WHEN moves.
         self._watermark_host_eviction()
 
-    _WATERMARK = float(os.environ.get("SGLANG_HICACHE_HOST_EVICT_WATERMARK", "0.95"))
-    _WATERMARK_STEP_TOKENS = int(
-        os.environ.get("SGLANG_HICACHE_HOST_EVICT_STEP_TOKENS", "65536")
-    )
-
-    def _watermark_host_eviction(self) -> None:
-        if self._WATERMARK <= 0 or self.cache_controller is None:
-            return
-        pool = self.cache_controller.mem_pool_host
-        if pool is None:
-            return
-        size = getattr(pool, "size", 0)
-        if not size:
-            return
-        used = size - pool.available_size()
-        target_used = int(size * self._WATERMARK)
-        # Hysteresis: drive_host_eviction rebuilds an O(host-leaves) heap per
-        # call (measured 2.8% of scheduler wall at hicache-size 80 with the
-        # pool pinned at the watermark, firing every step for a few thousand
-        # tokens). Fire only once a full step batch has accumulated so the
-        # rebuild amortizes; the backup barrier still always finds free pages
-        # (size * (1 - watermark) - step_tokens of slack).
-        if used - target_used < self._WATERMARK_STEP_TOKENS:
-            return
-        self.evict_host(self._WATERMARK_STEP_TOKENS, BASE_COMPONENT_TYPE)
-
+        # Per-step async-event processing. THIS MUST RUN EVERY STEP: it reaps
+        # write/load acks and drains storage control queues. f61491b9a
+        # accidentally absorbed this tail into _watermark_host_eviction (after
+        # its early-returns), so it only ran while watermark eviction was
+        # firing — at large hicache sizes far below the watermark, write acks
+        # were NEVER reaped per step (only at blocking device-eviction
+        # barriers) and load acks never committed: the pool-size-dependent
+        # degradation observed at hicache-80 (TPOT 163ms vs 63ms at 16).
         if self.pp_size != 1:
             self.writing_check()
             self.loading_check()
@@ -2125,6 +2107,32 @@ class UnifiedRadixCache(BasePrefixCache):
             self.storage_metrics_collector.log_storage_metrics(
                 self.cache_controller.storage_backend.get_stats()
             )
+
+    _WATERMARK = float(os.environ.get("SGLANG_HICACHE_HOST_EVICT_WATERMARK", "0.95"))
+    _WATERMARK_STEP_TOKENS = int(
+        os.environ.get("SGLANG_HICACHE_HOST_EVICT_STEP_TOKENS", "65536")
+    )
+
+    def _watermark_host_eviction(self) -> None:
+        if self._WATERMARK <= 0 or self.cache_controller is None:
+            return
+        pool = self.cache_controller.mem_pool_host
+        if pool is None:
+            return
+        size = getattr(pool, "size", 0)
+        if not size:
+            return
+        used = size - pool.available_size()
+        target_used = int(size * self._WATERMARK)
+        # Hysteresis: drive_host_eviction rebuilds an O(host-leaves) heap per
+        # call (measured 2.8% of scheduler wall at hicache-size 80 with the
+        # pool pinned at the watermark, firing every step for a few thousand
+        # tokens). Fire only once a full step batch has accumulated so the
+        # rebuild amortizes; the backup barrier still always finds free pages
+        # (size * (1 - watermark) - step_tokens of slack).
+        if used - target_used < self._WATERMARK_STEP_TOKENS:
+            return
+        self.evict_host(self._WATERMARK_STEP_TOKENS, BASE_COMPONENT_TYPE)
 
     def ready_to_load_host_cache(self) -> int:
         """Notify the cache controller to start the KV cache loading."""
