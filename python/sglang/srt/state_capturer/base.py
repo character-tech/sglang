@@ -5,6 +5,10 @@ from typing import Optional
 import torch
 
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+from sglang.srt.mem_cache.pool_host.common import (
+    ALLOC_MEMORY_FUNCS,
+    HostTensorAllocator,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 
 logger = logging.getLogger(__name__)
@@ -52,13 +56,23 @@ class BaseDeviceCache:
 
 
 class BaseHostCache:
-    def __init__(self, num_tokens: int, num_layers: int, topk_size: int, name: str):
-        self.buffer = torch.zeros(
+    def __init__(
+        self, num_tokens: int, num_layers: int, topk_size: int, name: str, device: str
+    ):
+        # torch's caching host allocator rounds pinned blocks up to the next
+        # power of two, so allocating this num_tokens-scaled buffer through
+        # pin_memory=True pins up to 2x the requested bytes (20.4 GiB -> 32 GiB
+        # per rank on DeepSeek-V4 at 21M pool tokens). mmap + cudaHostRegister
+        # pins the exact size, same as the HiCache host pools.
+        alloc = ALLOC_MEMORY_FUNCS[device]
+        self.buffer = alloc(
             (num_tokens, num_layers, topk_size),
             dtype=torch.int32,
             device="cpu",
             pin_memory=True,
+            allocator=HostTensorAllocator(),
         )
+        self.buffer.zero_()
         self.num_tokens = num_tokens
         self.num_layers = num_layers
         self.topk_size = topk_size
@@ -115,7 +129,9 @@ class BaseTopkCapturer:
         self.num_layers = num_layers
         self.topk_size = topk_size
 
-        self.host_cache = BaseHostCache(num_tokens, num_layers, topk_size, name=name)
+        self.host_cache = BaseHostCache(
+            num_tokens, num_layers, topk_size, name=name, device=device
+        )
         self.device_cache = BaseDeviceCache(
             max_batch_size,
             num_layers,
