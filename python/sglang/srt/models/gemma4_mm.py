@@ -30,6 +30,7 @@ from transformers import (
 
 from sglang.srt.distributed import get_pp_group
 from sglang.srt.environ import envs
+from sglang.srt.runtime_context import get_mm
 from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
 from sglang.srt.layers.layernorm import Gemma4RMSNorm
 from sglang.srt.layers.linear import ReplicatedLinear
@@ -222,7 +223,12 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
 
         # Vision/audio encoders + their projection embedders are only consumed
         # at the input-embedding stage, so they live on the first PP rank only.
-        if self.pp_group.is_first_rank:
+        # With multimodal disabled (--disable-multimodal) skip them entirely:
+        # text-only serving never consumes them, and the towers are loaded
+        # UNQUANTIZED by design (bf16, ~GBs of HBM that otherwise comes out of
+        # the KV pools at fixed mem-fraction). Same gating pattern as mllama4.
+        self._mm_towers_enabled = get_mm().enable_multimodal
+        if self.pp_group.is_first_rank and self._mm_towers_enabled:
             vision_tower_quant_config = self._vision_tower_quant_config(quant_config)
             self.vision_tower = Gemma4VisionEncoder(
                 config=config.vision_config,
@@ -907,6 +913,13 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
 
         for name, loaded_weight in weights:
             if "embed_vision.embedding." in name or "embed_audio.embedding." in name:
+                continue
+            if not self._mm_towers_enabled and (
+                "vision_tower." in name
+                or "embed_vision." in name
+                or "audio_tower." in name
+                or "embed_audio." in name
+            ):
                 continue
             if self.audio_tower is None and (
                 "audio_tower." in name or "embed_audio." in name

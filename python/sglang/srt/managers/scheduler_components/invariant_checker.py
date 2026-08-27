@@ -456,6 +456,11 @@ class SchedulerInvariantChecker:
         return has_leak, messages
 
     def _check_tree_cache(self):
+        # CAI: opt-in. This walks the entire radix tree (all nodes + LRU list
+        # + size recount) on every scheduler-idle event; on a warm tree it
+        # blocks the event loop long enough to delay newly arrived batches.
+        if not envs.SGLANG_TREE_CACHE_SANITY_CHECK.get():
+            return
         if (
             self.tree_cache.is_tree_cache()
             and (self.is_hybrid_swa and self.tree_cache.supports_swa())

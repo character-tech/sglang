@@ -367,6 +367,9 @@ class ModelRunner:
         # Stored for later use by alloc_memory_pool().
         self.init_torch_distributed()
 
+        # Before any large allocation, so the cap governs the whole lifetime.
+        self.maybe_init_allocator_guard()
+
         # Init forward stream for overlap schedule
         self.forward_stream = torch.get_device_module(self.device).Stream()
 
@@ -984,6 +987,13 @@ class ModelRunner:
             moe_ep_size=self.ps.moe_ep_size,
             moe_dp_size=self.ps.moe_dp_size,
         )
+
+    def maybe_init_allocator_guard(self):
+        from sglang.srt.model_executor.allocator_guard import (
+            maybe_apply_torch_mem_cap,
+        )
+
+        maybe_apply_torch_mem_cap(gpu_id=self.gpu_id)
 
     def init_torch_distributed(self):
         result = bootstrap.init_torch_distributed(

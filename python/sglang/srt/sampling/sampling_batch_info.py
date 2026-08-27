@@ -49,6 +49,11 @@ class SamplingBatchInfo:
 
     # Masking tensors for grammar-guided structured outputs
     vocab_size: int
+
+    # CPU-side max of per-request top_k (TOP_K_ALL when any request leaves
+    # top_k unset). Lets the sampler gate a topk-slice fast path without a
+    # GPU sync. Kept conservative across filter_batch (may stay high).
+    max_top_k_cpu: int = 0
     grammars: Optional[List[Optional[BaseGrammarObject]]] = None
     rids_int: Optional[torch.Tensor] = None
     bootstrap_room_ids_int: Optional[torch.Tensor] = None
@@ -207,6 +212,9 @@ class SamplingBatchInfo:
             need_top_p_sampling=any(r.sampling_params.top_p != 1.0 for r in reqs),
             need_top_k_sampling=any(r.sampling_params.top_k != TOP_K_ALL for r in reqs),
             need_min_p_sampling=any(r.sampling_params.min_p > 0 for r in reqs),
+            max_top_k_cpu=max(
+                (r.sampling_params.top_k for r in reqs), default=0
+            ),
             vocab_size=vocab_size,
             penalizer_orchestrator=penalizer_orchestrator,
             has_custom_logit_processor=has_custom_logit_processor,
@@ -388,6 +396,7 @@ class SamplingBatchInfo:
 
     def merge_batch(self, other: SamplingBatchInfo):
         self.penalizer_orchestrator.merge(other.penalizer_orchestrator)
+        self.max_top_k_cpu = max(self.max_top_k_cpu, other.max_top_k_cpu)
 
         # Merge the custom logit processors and custom params lists
         if self.has_custom_logit_processor or other.has_custom_logit_processor:
