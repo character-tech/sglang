@@ -33,7 +33,16 @@ from sglang.srt.utils import get_bool_env_var, is_hip
 __all__ = ["CompressedTensorsW8A8Fp8"]
 
 _is_hip = is_hip()
-_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+# CAI: this flag gates BOTH the load-time bpreshuffle weight layout and the
+# aiter ptpc GEMM in apply_weights, so the pair stays consistent.
+# SGLANG_USE_AITER_PTPC_GEMM=0 opts the dense per-channel linear out of aiter
+# (gemm_a8w8_bpreshuffle rejects K not 128-aligned on gfx942, e.g. gemma-4-26B
+# K=2112) while leaving aiter enabled for attention/quant/MoE.
+_use_aiter = (
+    get_bool_env_var("SGLANG_USE_AITER")
+    and get_bool_env_var("SGLANG_USE_AITER_PTPC_GEMM", "true")
+    and _is_hip
+)
 if _use_aiter:
     from aiter.ops.shuffle import shuffle_weight
 

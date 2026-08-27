@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import functools
 import inspect
+import logging
 from dataclasses import dataclass
 from enum import Enum
 from typing import TYPE_CHECKING, Any, Optional, Union
@@ -91,17 +92,40 @@ class AiterRunnerOutput(RunnerOutput):
         return MoeRunnerBackend.AITER
 
 
+logger = logging.getLogger(__name__)
+
 _AITER_ACTIVATIONS = {
     "silu": "Silu",
     "swiglu": "Swiglu",
     "situ": "Situv2",
+    # gelu_tanh needs an aiter build whose ActivationType provides GeluTanh;
+    # upstream aiter currently ships only erf Gelu. Feature-detected in
+    # _aiter_activation: fall back to erf-GELU with a warning, so aiter builds
+    # without the kernel keep exactly their pre-gelu_tanh behavior.
+    "gelu_tanh": "GeluTanh",
 }
+
+
+@functools.cache
+def _warn_activation_fallback(activation: str, name: str) -> None:
+    logger.warning(
+        "the installed aiter build has no ActivationType.%s kernel for "
+        "activation=%r; falling back to erf-GELU, which mismatches the "
+        "checkpoint's activation. For exact numerics use the triton MoE "
+        "runner (SGLANG_USE_AITER=0) or an aiter build that provides it.",
+        name,
+        activation,
+    )
 
 
 def _aiter_activation(activation: str):
     from aiter import ActivationType
 
-    return getattr(ActivationType, _AITER_ACTIVATIONS.get(activation, "Gelu"))
+    name = _AITER_ACTIVATIONS.get(activation, "Gelu")
+    if not hasattr(ActivationType, name):
+        _warn_activation_fallback(activation, name)
+        name = "Gelu"
+    return getattr(ActivationType, name)
 
 
 def _aiter_quant_type(quant_type: AiterQuantType):

@@ -65,6 +65,12 @@ _is_gfx95_supported = is_gfx95_supported()
 _is_musa = is_musa()
 
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+# CAI: aiter gemm_a8w8_bpreshuffle has no kernel for shapes whose K is not
+# 128-aligned on gfx942 (e.g. gemma-4-26B-A4B dense K=2112) and raises
+# "This GEMM is not supported!" with no fallback. SGLANG_USE_AITER_PTPC_GEMM=0
+# routes the dynamic per-token x per-channel dense GEMM to rowwise
+# torch._scaled_mm while keeping aiter everywhere else.
+_use_aiter_ptpc = _use_aiter and get_bool_env_var("SGLANG_USE_AITER_PTPC_GEMM", "true")
 _use_aiter_gfx95 = _use_aiter and _is_gfx95_supported
 # ROCm 7.0 hipcc miscompiles gemm_a8w8_blockscale_bpreshuffle on gfx95 (#23319).
 _use_aiter_bpreshuffle_gfx95 = _use_aiter_gfx95 and get_hip_version() >= (7, 2, 0)
@@ -1946,12 +1952,12 @@ def apply_fp8_linear(
         use_per_token_if_dynamic
         and not per_tensor_weights
         and not per_tensor_activations
-        and (USE_ROWWISE_TORCH_SCALED_MM or _use_aiter)
+        and (USE_ROWWISE_TORCH_SCALED_MM or _use_aiter_ptpc)
     ):
         # into this sector means use dynamic per-token-per-channel quant
         # per-token scale quant for input matrix, every row(one token) have one scale factor
         # per-channel scale quant for weight matrix, every col(one channel) have one scale factor
-        if _use_aiter:
+        if _use_aiter_ptpc:
             # gemm_a8w8_bpreshuffle(XQ, WQ, x_scale, w_scale, dtype)
             # XQ -> input tensor, shape = (m, k)
             # WQ -> weight tensor, shape = (n, k), with preshuffe get better perf

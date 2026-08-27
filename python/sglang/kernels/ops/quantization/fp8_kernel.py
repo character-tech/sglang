@@ -1909,10 +1909,13 @@ if _is_hip:
         absmax = input.abs().max(dim=1, keepdim=True).values
         absmax = torch.clamp(absmax, min=eps)
         scale_val = absmax / fp8_max
-        scale.copy_(scale_val)
+        # output/scale may have more rows than input when the caller requested
+        # num_token_padding (the pad-to-17 small-M torch._scaled_mm workaround);
+        # only the first M rows are written, matching the aiter/vLLM kernels.
+        scale[:M].copy_(scale_val)
         # Quantize
         output_data = torch.clamp(input / scale_val, fp8_min, fp8_max).to(fp8_dtype)
-        output.copy_(output_data)
+        output[:M].copy_(output_data)
 
     def _native_dynamic_per_tensor_quant_fp8(output, input, scale):
         """Native PyTorch fallback for dynamic per-tensor FP8 quantization when vLLM is unavailable."""

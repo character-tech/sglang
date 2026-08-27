@@ -14,6 +14,7 @@ from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
 from sglang.srt.layers.moe.moe_runner.triton import TritonMoeQuantInfo
 from sglang.srt.layers.moe.utils import (
     get_moe_a2a_backend,
+    get_moe_padding_size,
     get_moe_runner_backend,
     get_moe_weight_sizes,
 )
@@ -326,6 +327,34 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
                     requires_grad=False,
                 )
                 torch.cuda.empty_cache()
+        elif (
+            _is_hip
+            and not _use_aiter
+            and not self.use_flashinfer_trtllm
+            and self.weight_quant.strategy != QuantizationStrategy.BLOCK
+            and get_moe_padding_size(is_aiter_moe=False) > 0
+        ):
+            # The Triton fused-MoE runner assumes fp8 weights are padded by
+            # TRITON_PADDING_SIZE in the K dim whenever SGLANG_MOE_PADDING is
+            # set (the ROCm images bake SGLANG_MOE_PADDING=1). Fp8MoEMethod
+            # pads its weights accordingly, but this scheme did not, tripping
+            # the "Hidden size mismatch" assert in fused_experts_impl. Mirror
+            # Fp8MoEMethod's padding.
+            padding_size = get_moe_padding_size(is_aiter_moe=False)
+            layer.w13_weight = torch.nn.Parameter(
+                torch.nn.functional.pad(
+                    layer.w13_weight.data, (0, padding_size), "constant", 0
+                ),
+                requires_grad=False,
+            )
+            torch.cuda.empty_cache()
+            layer.w2_weight = torch.nn.Parameter(
+                torch.nn.functional.pad(
+                    layer.w2_weight.data, (0, padding_size), "constant", 0
+                ),
+                requires_grad=False,
+            )
+            torch.cuda.empty_cache()
 
         if (
             self.weight_quant.strategy == QuantizationStrategy.BLOCK
