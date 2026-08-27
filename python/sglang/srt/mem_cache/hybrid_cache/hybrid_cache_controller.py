@@ -875,7 +875,18 @@ class HybridCacheController(BaseHiCacheController):
                 evict_fn = entry.device_evict_fn
                 size = len(pool.host_indices)
             indices = alloc_fn(size)
-            if indices is None and evict_fn:
+            # Host-side alloc failure must NOT trigger eviction from here:
+            # write() runs inside insert/evict action barriers, and
+            # host_evict_fn re-enters the tree walk (drive_host_eviction can
+            # free device values and destroy nodes the in-flight walk already
+            # captured in its backup spec, feeding stale indices to the
+            # transfer kernels -> GPU memory access fault at host-pool
+            # saturation). Callers pre-evict host pools at a safe barrier
+            # (see UnifiedRadixCache._execute_kv_backup); a miss here is a
+            # clean skip. The device-side retry (load-back path) keeps the
+            # evict_fn fallback: device eviction from the match path is the
+            # normal alloc-with-evict flow, not a re-entrant walk.
+            if indices is None and evict_fn and not alloc_host:
                 evict_fn(size)
                 indices = alloc_fn(size)
             if indices is None:

@@ -793,8 +793,14 @@ class UnifiedRadixCache(BasePrefixCache):
         insert_params.value = values
         result = self.insert(insert_params)
 
-        # Match prefix
-        match_result = self.match_prefix(MatchPrefixParams(key=radix_key))
+        # Match prefix. Bookkeeping mode: this rematch decides which
+        # contiguous device-resident prefix the request now sits on (locks,
+        # cache_protected_len, req_to_token rewrite) — it must cover every
+        # node the insert donated/unevicted, so endpoint-quality validators
+        # (SWA window rule) do not apply here.
+        match_result = self.match_prefix(
+            MatchPrefixParams(key=radix_key, bookkeeping=True)
+        )
         new_indices = match_result.device_indices
         new_last_node = match_result.last_device_node
         new_prefix_len = result.prefix_len
@@ -949,6 +955,33 @@ class UnifiedRadixCache(BasePrefixCache):
                 return None
         aux_xfers = [x for xfers in comp_xfers.values() for x in xfers]
         aux_xfers.extend(sidecar_xfers)
+        # Pre-evict the extra host pools (SWA/Mamba) here, at the same action
+        # barrier where the anchor pool is pre-evicted above. write() must
+        # never evict host pools itself (re-entrant tree walk -> GPU fault at
+        # host saturation; see _resolve_pool_transfers_allocation).
+        pool_to_component = {
+            PoolName.SWA: ComponentType.SWA,
+            PoolName.MAMBA: ComponentType.MAMBA,
+        }
+        extra_needs: dict[PoolName, int] = {}
+        for xfer in aux_xfers:
+            if (
+                xfer.indices_from_pool is None
+                and xfer.name in pool_to_component
+                and xfer.device_indices is not None
+            ):
+                extra_needs[xfer.name] = extra_needs.get(xfer.name, 0) + len(
+                    xfer.device_indices
+                )
+        for pool_name, need in extra_needs.items():
+            entry = self.cache_controller.mem_pool_host.entry_map.get(pool_name)
+            if entry is None:
+                continue
+            avail = entry.host_pool.available_size()
+            if avail < need:
+                shortfall = need - avail
+                if self.evict_host(shortfall, pool_to_component[pool_name]) < shortfall:
+                    return None
         return self.cache_controller.write(
             device_value, node_id=node_id, extra_pools=aux_xfers or None
         )
@@ -2020,6 +2053,24 @@ class UnifiedRadixCache(BasePrefixCache):
         # Reap the previous round's PP-sync sends before issuing new ones.
         self._drain_async_work()
 
+        # CAI watermark host eviction: keep the FULL host pool below the
+        # watermark by evicting a bounded batch per scheduler step, so the
+        # write-back backup barrier always finds free pages and never runs
+        # the (synchronous, python-heavy) host eviction itself. Measured
+        # 2026-08-18: at 100% host fill the barrier-time eviction cuts the
+        # service rate 10-50% the moment the pool saturates. Same eviction
+        # entry point as the barrier path (drive_host_eviction) -> same
+        # DMA/lock safety invariants; only the WHEN moves.
+        self._watermark_host_eviction()
+
+        # Per-step async-event processing. THIS MUST RUN EVERY STEP: it reaps
+        # write/load acks and drains storage control queues. f61491b9a
+        # accidentally absorbed this tail into _watermark_host_eviction (after
+        # its early-returns), so it only ran while watermark eviction was
+        # firing — at large hicache sizes far below the watermark, write acks
+        # were NEVER reaped per step (only at blocking device-eviction
+        # barriers) and load acks never committed: the pool-size-dependent
+        # degradation observed at hicache-80 (TPOT 163ms vs 63ms at 16).
         if self.pp_size != 1:
             self.writing_check()
             self.loading_check()
@@ -2056,6 +2107,32 @@ class UnifiedRadixCache(BasePrefixCache):
             self.storage_metrics_collector.log_storage_metrics(
                 self.cache_controller.storage_backend.get_stats()
             )
+
+    _WATERMARK = float(os.environ.get("SGLANG_HICACHE_HOST_EVICT_WATERMARK", "0.95"))
+    _WATERMARK_STEP_TOKENS = int(
+        os.environ.get("SGLANG_HICACHE_HOST_EVICT_STEP_TOKENS", "65536")
+    )
+
+    def _watermark_host_eviction(self) -> None:
+        if self._WATERMARK <= 0 or self.cache_controller is None:
+            return
+        pool = self.cache_controller.mem_pool_host
+        if pool is None:
+            return
+        size = getattr(pool, "size", 0)
+        if not size:
+            return
+        used = size - pool.available_size()
+        target_used = int(size * self._WATERMARK)
+        # Hysteresis: drive_host_eviction rebuilds an O(host-leaves) heap per
+        # call (measured 2.8% of scheduler wall at hicache-size 80 with the
+        # pool pinned at the watermark, firing every step for a few thousand
+        # tokens). Fire only once a full step batch has accumulated so the
+        # rebuild amortizes; the backup barrier still always finds free pages
+        # (size * (1 - watermark) - step_tokens of slack).
+        if used - target_used < self._WATERMARK_STEP_TOKENS:
+            return
+        self.evict_host(self._WATERMARK_STEP_TOKENS, BASE_COMPONENT_TYPE)
 
     def ready_to_load_host_cache(self) -> int:
         """Notify the cache controller to start the KV cache loading."""

@@ -55,6 +55,12 @@ class MatchPrefixParams:
     cow_mamba: bool = False
     req: Optional[Req] = None
 
+    # Ownership rematch (cache_unfinished_req bookkeeping): the device match
+    # must cover the full contiguous device-resident prefix the request sits
+    # on, not just endpoints valid for a future request's admission. See
+    # SWAComponent.create_match_validator.
+    bookkeeping: bool = False
+
 
 @dataclasses.dataclass
 class InsertParams:
